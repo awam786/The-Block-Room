@@ -10,7 +10,9 @@ async def init_db():
     global _pool
 
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not configured.")
+        raise RuntimeError(
+            "DATABASE_URL is not configured."
+        )
 
     _pool = await asyncpg.create_pool(
         DATABASE_URL,
@@ -31,7 +33,9 @@ async def close_db():
 
 def get_pool():
     if _pool is None:
-        raise RuntimeError("Database pool has not been initialized.")
+        raise RuntimeError(
+            "Database pool has not been initialized."
+        )
 
     return _pool
 
@@ -40,7 +44,9 @@ async def create_tables():
     pool = get_pool()
 
     async with pool.acquire() as conn:
-        await conn.execute("""
+
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
                 id BIGSERIAL PRIMARY KEY,
                 telegram_id BIGINT UNIQUE NOT NULL,
@@ -110,13 +116,29 @@ async def create_tables():
                 token_name TEXT,
                 token_symbol TEXT,
                 status TEXT NOT NULL DEFAULT 'ACTIVE',
+
                 score NUMERIC(30, 10) DEFAULT 0,
+
                 volume_24h NUMERIC(30, 10) DEFAULT 0,
                 market_cap NUMERIC(30, 10) DEFAULT 0,
                 liquidity NUMERIC(30, 10) DEFAULT 0,
                 price_change_24h NUMERIC(30, 10) DEFAULT 0,
+
+                buys_24h BIGINT DEFAULT 0,
+                sells_24h BIGINT DEFAULT 0,
+
+                rank INTEGER,
+
+                paid_promotion BOOLEAN DEFAULT TRUE,
+
+                last_activity_at TIMESTAMPTZ,
+                last_volume_24h NUMERIC(30, 10) DEFAULT 0,
+
+                inactivity_started_at TIMESTAMPTZ,
+
                 started_at TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ,
+
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
 
@@ -157,14 +179,103 @@ async def create_tables():
                 order_id BIGINT REFERENCES orders(id),
                 used_at TIMESTAMPTZ DEFAULT NOW()
             );
-        """)
+            """
+        )
 
-        # Default pricing
+        # ----------------------------------------------------
+        # DATABASE UPGRADES FOR EXISTING INSTALLATIONS
+        # ----------------------------------------------------
+
+        await conn.execute(
+            """
+            ALTER TABLE trends
+            ADD COLUMN IF NOT EXISTS buys_24h BIGINT DEFAULT 0;
+
+            ALTER TABLE trends
+            ADD COLUMN IF NOT EXISTS sells_24h BIGINT DEFAULT 0;
+
+            ALTER TABLE trends
+            ADD COLUMN IF NOT EXISTS rank INTEGER;
+
+            ALTER TABLE trends
+            ADD COLUMN IF NOT EXISTS paid_promotion BOOLEAN DEFAULT TRUE;
+
+            ALTER TABLE trends
+            ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ;
+
+            ALTER TABLE trends
+            ADD COLUMN IF NOT EXISTS last_volume_24h
+                NUMERIC(30, 10) DEFAULT 0;
+
+            ALTER TABLE trends
+            ADD COLUMN IF NOT EXISTS inactivity_started_at
+                TIMESTAMPTZ;
+            """
+        )
+
+        # ----------------------------------------------------
+        # DEFAULT TRENDING SETTINGS
+        # ----------------------------------------------------
+
         await conn.executemany(
             """
-            INSERT INTO pricing (duration_hours, price_usdt)
+            INSERT INTO settings (
+                key,
+                value
+            )
             VALUES ($1, $2)
-            ON CONFLICT (duration_hours) DO NOTHING
+            ON CONFLICT (key)
+            DO NOTHING
+            """,
+            [
+                (
+                    "payment_tolerance_usdt",
+                    "0.10",
+                ),
+                (
+                    "payment_confirmations",
+                    "3",
+                ),
+                (
+                    "trending_inactivity_minutes",
+                    "10",
+                ),
+                (
+                    "trending_update_seconds",
+                    "30",
+                ),
+                (
+                    "paid_start_rank_low_mc",
+                    "5",
+                ),
+                (
+                    "paid_start_rank_high_mc",
+                    "3",
+                ),
+                (
+                    "paid_high_mc_threshold",
+                    "100000",
+                ),
+                (
+                    "paid_top_mc_threshold",
+                    "500000",
+                ),
+            ],
+        )
+
+        # ----------------------------------------------------
+        # DEFAULT PRICES
+        # ----------------------------------------------------
+
+        await conn.executemany(
+            """
+            INSERT INTO pricing (
+                duration_hours,
+                price_usdt
+            )
+            VALUES ($1, $2)
+            ON CONFLICT (duration_hours)
+            DO NOTHING
             """,
             [
                 (2, 110),
