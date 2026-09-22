@@ -1,41 +1,34 @@
 import asyncio
-import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Dict, List, Optional
 
 import httpx
 
 from config import (
-    BUYBOT_BLOCK_BATCH_SIZE,
-    BUYBOT_POLL_SECONDS,
     BNB_RPC_URL,
     ETHEREUM_RPC_URL,
     ROBINHOOD_RPC_URL,
+    BUYBOT_BLOCK_BATCH_SIZE,
+    BUYBOT_POLL_SECONDS,
 )
 
 from database.connection import get_pool
+
+from services.buybot_events import BuyEvent
 
 from services.buybot_dispatcher import (
     process_buy_event,
 )
 
-from services.buybot_events import (
-    BuyEvent,
+from services.evm_metadata import (
+    PairMetadata,
+    get_pair_metadata,
+    get_swap_amounts,
 )
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-SWAP_EVENT_TOPIC = (
-    "0xd78ad95fa46c994b6551d0da85fc275fe613b0"
-    "046efc9f1e2c8f3f7c8f7c7c"
-)
-
-# Standard Uniswap V2-style Swap event:
-#
+# Standard Uniswap V2-style:
 # Swap(
 #     address indexed sender,
 #     uint256 amount0In,
@@ -44,147 +37,214 @@ SWAP_EVENT_TOPIC = (
 #     uint256 amount1Out,
 #     address indexed to
 # )
-#
-# Topic 0:
-# keccak256("Swap(address,uint256,uint256,uint256,uint256,address)")
+SWAP_EVENT_TOPIC = (
+    "0xd78ad95fa46c994b6551d0da85fc275"
+    "fe613ce37657fb8d5e3d130840159d822"
+)
 
 
 @dataclass
 class EVMChain:
     name: str
-    rpc_url: str
-    native_symbol: str
     chain_id: int
+    rpc_url: str
 
 
-CHAINS = {
-    "ethereum": EVMChain(
+EVM_CHAINS = [
+    EVMChain(
         name="ethereum",
-        rpc_url=ETHEREUM_RPC_URL,
-        native_symbol="ETH",
         chain_id=1,
+        rpc_url=ETHEREUM_RPC_URL,
     ),
-
-    "bnb": EVMChain(
+    EVMChain(
         name="bnb",
-        rpc_url=BNB_RPC_URL,
-        native_symbol="BNB",
         chain_id=56,
+        rpc_url=BNB_RPC_URL,
     ),
-
-    "robinhood": EVMChain(
+    EVMChain(
         name="robinhood",
-        rpc_url=ROBINHOOD_RPC_URL,
-        native_symbol="ETH",
         chain_id=4663,
+        rpc_url=ROBINHOOD_RPC_URL,
     ),
-}
+]
 
 
-# ============================================================
-# JSON-RPC
-# ============================================================
+_pair_cache: Dict[str, PairMetadata] = {}
+
 
 async def rpc_call(
-    client: httpx.AsyncClient,
     rpc_url: str,
     method: str,
     params: list,
 ):
     payload = {
         "jsonrpc": "2.0",
-        "id": int(time.time() * 1000),
+        "id": "the-block-room",
         "method": method,
         "params": params,
     }
 
-    response = await client.post(
-        rpc_url,
-        json=payload,
-    )
+    async with httpx.AsyncClient(
+        timeout=20
+    ) as client:
+        response = await client.post(
+            rpc_url,
+            json=payload,
+        )
 
-    response.raise_for_status()
+        response.raise_for_status()
 
-    data = response.json()
+        data = response.json()
 
     if data.get("error"):
         raise RuntimeError(
-            str(data["error"])
+            data["error"].get(
+                "message",
+                "RPC request failed",
+            )
         )
 
     return data.get("result")
 
 
 async def get_block_number(
-    client: httpx.AsyncClient,
     rpc_url: str,
 ) -> int:
-
     result = await rpc_call(
-        client,
         rpc_url,
         "eth_blockNumber",
         [],
     )
 
-    return int(
-        result,
-        16,
-    )
+    return int(result, 16)
 
 
 async def get_logs(
-    client: httpx.AsyncClient,
     rpc_url: str,
     from_block: int,
     to_block: int,
-    addresses: list[str],
+    pair_addresses: List[str],
 ):
-    if not addresses:
+    if not pair_addresses:
         return []
 
-    params = [
-        {
-            "fromBlock": hex(from_block),
-            "toBlock": hex(to_block),
-            "address": addresses,
-            "topics": [
-                SWAP_EVENT_TOPIC
-            ],
-        }
-    ]
-
-    result = await rpc_call(
-        client,
+    logs = await rpc_call(
         rpc_url,
         "eth_getLogs",
-        params,
+        [
+            {
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "address": pair_addresses,
+                "topics": [
+                    SWAP_EVENT_TOPIC,
+                ],
+            }
+        ],
     )
 
-    return result or []
+    return logs or []
 
 
-# ============================================================
-# TOKEN LOOKUP
-# ============================================================
+def decode_uint256(
+    value: str,
+) -> int:
+    if not value:
+        return 0
+
+    return int(value, 16)
+
+
+def decode_swap_log(
+    log: dict,
+):
+    data = log.get("data")
+
+    if not data or data == "0x":
+        return None
+
+    raw = data[2:]
+
+    # Four uint256 values = 128 bytes = 256 hex characters.
+    if len(raw) < 256:
+        return None
+
+    try:
+        amount0_in = decode_uint256(
+            raw[0:64]
+        )
+
+        amount1_in = decode_uint256(
+            raw[64:128]
+        )
+
+        amount0_out = decode_uint256(
+            raw[128:192]
+        )
+
+        amount1_out = decode_uint256(
+            raw[192:256]
+        )
+
+    except ValueError:
+        return None
+
+    topics = log.get("topics") or []
+
+    sender = ""
+
+    buyer_or_recipient = ""
+
+    if len(topics) >= 2:
+        sender = (
+            "0x"
+            + topics[1][-40:]
+        )
+
+    if len(topics) >= 3:
+        buyer_or_recipient = (
+            "0x"
+            + topics[2][-40:]
+        )
+
+    return {
+        "pair_address": (
+            log.get("address") or ""
+        ).lower(),
+        "sender": sender,
+        "recipient": buyer_or_recipient,
+        "amount0_in": amount0_in,
+        "amount1_in": amount1_in,
+        "amount0_out": amount0_out,
+        "amount1_out": amount1_out,
+        "block_number": int(
+            log.get("blockNumber", "0x0"),
+            16,
+        ),
+        "tx_hash": log.get(
+            "transactionHash"
+        ),
+        "log_index": int(
+            log.get("logIndex", "0x0"),
+            16,
+        ),
+    }
+
 
 async def get_monitored_pairs(
     chain: str,
 ):
-    pool = get_pool()
+    pool = await get_pool()
 
-    async with pool.acquire() as conn:
-
-        rows = await conn.fetch(
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
             """
             SELECT
                 group_id,
-                chain,
                 contract_address,
-                token_name,
-                token_symbol,
                 pair_address,
-                dex_url
+                token_name,
+                token_symbol
             FROM buybot_tokens
             WHERE LOWER(chain) = LOWER($1)
               AND enabled = TRUE
@@ -197,360 +257,384 @@ async def get_monitored_pairs(
     return rows
 
 
-# ============================================================
-# HEX HELPERS
-# ============================================================
+async def get_pair_cache(
+    rpc_url: str,
+    pair_address: str,
+) -> Optional[PairMetadata]:
+    key = pair_address.lower()
 
-def hex_to_int(
-    value: str,
-) -> int:
+    if key in _pair_cache:
+        return _pair_cache[key]
 
-    if not value:
-        return 0
-
-    return int(
-        value,
-        16,
+    pair = await get_pair_metadata(
+        rpc_url,
+        pair_address,
     )
 
+    if pair:
+        _pair_cache[key] = pair
 
-def decode_word(
-    data: str,
-    index: int,
-) -> int:
-
-    clean = data[2:] if data.startswith("0x") else data
-
-    start = index * 64
-    end = start + 64
-
-    if len(clean) < end:
-        return 0
-
-    return int(
-        clean[start:end],
-        16,
-    )
+    return pair
 
 
-def decode_address_from_topic(
-    topic: str,
-) -> str:
+def choose_quote_amount(
+    swap_data: dict,
+    decoded_amounts: dict,
+) -> Decimal:
+    """
+    Select the amount entering the pool as the quote side.
 
-    clean = topic[2:] if topic.startswith("0x") else topic
+    For a BUY, the quote asset is normally the input.
+    """
 
-    return (
-        "0x"
-        + clean[-40:]
-    )
+    if not decoded_amounts["is_buy"]:
+        return Decimal("0")
+
+    return decoded_amounts["quote_in"]
 
 
-def decode_swap_log(
-    log: dict,
-) -> Optional[dict]:
+def is_probable_stablecoin(
+    symbol: str,
+) -> bool:
+    return symbol.upper() in {
+        "USDT",
+        "USDC",
+        "DAI",
+        "FDUSD",
+        "BUSD",
+    }
 
-    topics = log.get("topics") or []
 
-    data = log.get("data") or "0x"
+def estimate_usd_value(
+    quote_amount: Decimal,
+    quote_symbol: str,
+) -> Decimal:
+    """
+    Stablecoin pairs can be valued directly in USD.
 
-    if len(topics) < 3:
-        return None
+    Native-asset pairs are handled later by the
+    price layer. For now they return zero rather
+    than inventing a USD price.
+    """
 
-    try:
+    if quote_amount <= 0:
+        return Decimal("0")
 
-        sender = decode_address_from_topic(
-            topics[1]
-        )
-
-        recipient = decode_address_from_topic(
-            topics[2]
-        )
-
-        amount0_in = decode_word(
-            data,
-            0,
-        )
-
-        amount1_in = decode_word(
-            data,
-            1,
-        )
-
-        amount0_out = decode_word(
-            data,
-            2,
-        )
-
-        amount1_out = decode_word(
-            data,
-            3,
-        )
-
-        return {
-            "sender": sender,
-            "recipient": recipient,
-            "amount0_in": amount0_in,
-            "amount1_in": amount1_in,
-            "amount0_out": amount0_out,
-            "amount1_out": amount1_out,
-        }
-
-    except (
-        ValueError,
-        IndexError,
+    if is_probable_stablecoin(
+        quote_symbol
     ):
+        return quote_amount
 
+    return Decimal("0")
+
+
+async def build_buy_event(
+    chain: EVMChain,
+    monitored_token: dict,
+    swap_data: dict,
+):
+    pair_address = swap_data["pair_address"]
+
+    pair = await get_pair_cache(
+        chain.rpc_url,
+        pair_address,
+    )
+
+    if not pair:
         return None
 
+    decoded = get_swap_amounts(
+        pair=pair,
+        monitored_address=monitored_token[
+            "contract_address"
+        ],
+        amount0_in=swap_data[
+            "amount0_in"
+        ],
+        amount1_in=swap_data[
+            "amount1_in"
+        ],
+        amount0_out=swap_data[
+            "amount0_out"
+        ],
+        amount1_out=swap_data[
+            "amount1_out"
+        ],
+    )
 
-# ============================================================
-# EVENT CLASSIFICATION
-# ============================================================
+    if not decoded:
+        return None
 
-def classify_swap(
-    swap: dict,
-) -> Optional[str]:
-    """
-    Basic Uniswap-V2-style classification.
+    if not decoded["is_buy"]:
+        return None
 
-    A swap where one side enters and the other
-    side leaves is detected here.
+    quote_amount = choose_quote_amount(
+        swap_data,
+        decoded,
+    )
 
-    Exact BUY/SELL determination requires knowing
-    which pair token is the monitored token.
-    """
+    quote_symbol = decoded[
+        "quote_symbol"
+    ]
 
-    token0_in = swap["amount0_in"] > 0
-    token1_in = swap["amount1_in"] > 0
+    spent_usd = estimate_usd_value(
+        quote_amount,
+        quote_symbol,
+    )
 
-    token0_out = swap["amount0_out"] > 0
-    token1_out = swap["amount1_out"] > 0
+    monitored_address = (
+        monitored_token[
+            "contract_address"
+        ]
+    ).lower()
 
-    if token0_in and token1_out:
-        return "TOKEN0_OUT"
+    if pair.token0.address.lower() == monitored_address:
+        received_symbol = pair.token0.symbol
+    elif pair.token1.address.lower() == monitored_address:
+        received_symbol = pair.token1.symbol
+    else:
+        return None
 
-    if token1_in and token0_out:
-        return "TOKEN1_OUT"
+    return BuyEvent(
+        group_id=monitored_token[
+            "group_id"
+        ],
+        chain=chain.name,
+        tx_hash=swap_data[
+            "tx_hash"
+        ],
+        token_address=monitored_token[
+            "contract_address"
+        ],
+        token_name=(
+            monitored_token.get(
+                "token_name"
+            )
+            or (
+                pair.token0.name
+                if pair.token0.address.lower()
+                == monitored_address
+                else pair.token1.name
+            )
+        ),
+        token_symbol=(
+            monitored_token.get(
+                "token_symbol"
+            )
+            or received_symbol
+        ),
+        buyer_address=swap_data[
+            "recipient"
+        ] or swap_data[
+            "sender"
+        ],
+        spent_amount_usd=spent_usd,
+        spent_native_amount=quote_amount,
+        spent_native_symbol=quote_symbol,
+        received_amount=decoded[
+            "token_received"
+        ],
+        received_symbol=received_symbol,
+        market_cap_usd=Decimal("0"),
+        is_new_holder=False,
+        dex_url=None,
+        buy_url=None,
+        trending_url=None,
+        block_number=swap_data[
+            "block_number"
+        ],
+    )
 
-    return None
 
-
-# ============================================================
-# EVENT PROCESSING
-# ============================================================
-
-async def process_swap_log(
+async def process_chain_logs(
     chain: EVMChain,
-    log: dict,
-    pair_info: dict,
+    logs: list,
+    monitored_pairs: dict,
 ):
-    swap = decode_swap_log(
-        log
-    )
+    processed = 0
 
-    if not swap:
-        return
+    for log in logs:
+        swap_data = decode_swap_log(
+            log
+        )
 
-    direction = classify_swap(
-        swap
-    )
+        if not swap_data:
+            continue
 
-    if not direction:
-        return
+        pair_address = swap_data[
+            "pair_address"
+        ].lower()
 
-    # We intentionally do not yet claim which side
-    # is the monitored token.
-    #
-    # The next token/pair metadata layer will resolve
-    # token0/token1 and determine:
-    #
-    # native/stable -> monitored token = BUY
-    # monitored token -> native/stable = SELL
+        tokens = monitored_pairs.get(
+            pair_address
+        )
 
-    print(
-        "[BuyBot EVM]"
-        f" chain={chain.name}"
-        f" pair={log.get('address')}"
-        f" direction={direction}"
-        f" tx={log.get('transactionHash')}"
-    )
+        if not tokens:
+            continue
 
+        for monitored_token in tokens:
+            try:
+                event = await build_buy_event(
+                    chain,
+                    monitored_token,
+                    swap_data,
+                )
 
-# ============================================================
-# CHAIN SCANNER
-# ============================================================
+                if not event:
+                    continue
+
+                sent = await process_buy_event(
+                    event
+                )
+
+                processed += sent
+
+            except Exception as exc:
+                print(
+                    "Buy event processing error "
+                    f"chain={chain.name} "
+                    f"tx={swap_data.get('tx_hash')} "
+                    f"pair={pair_address}: "
+                    f"{exc}"
+                )
+
+    return processed
+
 
 async def scan_chain(
     chain: EVMChain,
 ):
     last_block = None
 
-    async with httpx.AsyncClient(
-        timeout=20
-    ) as client:
+    print(
+        f"BuyBot EVM detector started: "
+        f"{chain.name} "
+        f"(chain {chain.chain_id})"
+    )
 
-        while True:
+    while True:
+        try:
+            current_block = await get_block_number(
+                chain.rpc_url
+            )
 
-            try:
+            if last_block is None:
+                last_block = current_block - 1
 
-                current_block = (
-                    await get_block_number(
-                        client,
-                        chain.rpc_url,
-                    )
-                )
-
-                if last_block is None:
-
-                    last_block = max(
-                        0,
-                        current_block
-                        - BUYBOT_BLOCK_BATCH_SIZE,
-                    )
-
-                if current_block <= last_block:
-
-                    await asyncio.sleep(
-                        BUYBOT_POLL_SECONDS
-                    )
-
-                    continue
-
-                from_block = (
-                    last_block + 1
-                )
-
-                to_block = min(
-                    current_block,
-                    from_block
-                    + BUYBOT_BLOCK_BATCH_SIZE
-                    - 1,
-                )
-
-                pairs = (
-                    await get_monitored_pairs(
-                        chain.name
-                    )
-                )
-
-                pair_addresses = []
-
-                pair_map = {}
-
-                for row in pairs:
-
-                    pair_address = (
-                        row["pair_address"]
-                    )
-
-                    if not pair_address:
-                        continue
-
-                    normalized = (
-                        pair_address.lower()
-                    )
-
-                    pair_addresses.append(
-                        pair_address
-                    )
-
-                    pair_map[
-                        normalized
-                    ] = dict(row)
-
-                if pair_addresses:
-
-                    logs = await get_logs(
-                        client,
-                        chain.rpc_url,
-                        from_block,
-                        to_block,
-                        pair_addresses,
-                    )
-
-                    for log in logs:
-
-                        pair_address = (
-                            log.get(
-                                "address"
-                            )
-                        )
-
-                        pair_info = (
-                            pair_map.get(
-                                pair_address.lower()
-                            )
-                            if pair_address
-                            else None
-                        )
-
-                        if not pair_info:
-                            continue
-
-                        await process_swap_log(
-                            chain,
-                            log,
-                            pair_info,
-                        )
-
-                last_block = to_block
-
-            except Exception as exc:
-
-                print(
-                    "[BuyBot EVM detector error]"
-                    f" chain={chain.name}:"
-                    f" {exc}"
-                )
-
+            if current_block <= last_block:
                 await asyncio.sleep(
                     BUYBOT_POLL_SECONDS
                 )
+                continue
 
+            from_block = last_block + 1
 
-# ============================================================
-# START ALL EVM CHAINS
-# ============================================================
+            to_block = min(
+                current_block,
+                from_block
+                + BUYBOT_BLOCK_BATCH_SIZE
+                - 1,
+            )
+
+            rows = await get_monitored_pairs(
+                chain.name
+            )
+
+            monitored_pairs = {}
+
+            for row in rows:
+                pair_address = (
+                    row["pair_address"]
+                    or ""
+                ).lower()
+
+                if not pair_address:
+                    continue
+
+                monitored_pairs.setdefault(
+                    pair_address,
+                    [],
+                ).append(
+                    {
+                        "group_id": row[
+                            "group_id"
+                        ],
+                        "contract_address": row[
+                            "contract_address"
+                        ],
+                        "token_name": row[
+                            "token_name"
+                        ],
+                        "token_symbol": row[
+                            "token_symbol"
+                        ],
+                    }
+                )
+
+            pair_addresses = list(
+                monitored_pairs.keys()
+            )
+
+            if pair_addresses:
+                logs = await get_logs(
+                    chain.rpc_url,
+                    from_block,
+                    to_block,
+                    pair_addresses,
+                )
+
+                if logs:
+                    await process_chain_logs(
+                        chain,
+                        logs,
+                        monitored_pairs,
+                    )
+
+            last_block = to_block
+
+            await asyncio.sleep(
+                BUYBOT_POLL_SECONDS
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            print(
+                f"BuyBot detector error "
+                f"chain={chain.name}: "
+                f"{exc}"
+            )
+
+            await asyncio.sleep(
+                BUYBOT_POLL_SECONDS
+            )
+
 
 async def evm_detector_worker():
-    """
-    Run Ethereum, BNB and Robinhood
-    detectors concurrently.
-    """
-
     tasks = [
         asyncio.create_task(
-            scan_chain(
-                CHAINS["ethereum"]
-            )
-        ),
-
-        asyncio.create_task(
-            scan_chain(
-                CHAINS["bnb"]
-            )
-        ),
-
-        asyncio.create_task(
-            scan_chain(
-                CHAINS["robinhood"]
-            )
-        ),
+            scan_chain(chain)
+        )
+        for chain in EVM_CHAINS
     ]
 
-    try:
+    print(
+        "EVM BuyBot detector worker launched."
+    )
 
+    try:
         await asyncio.gather(
             *tasks
         )
 
-    finally:
-
+    except asyncio.CancelledError:
         for task in tasks:
-
             task.cancel()
 
         await asyncio.gather(
             *tasks,
             return_exceptions=True,
         )
+
+        raise
