@@ -1,4 +1,5 @@
 from telegram import Update
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,9 +19,7 @@ from database.connection import (
 
 from handlers.start import start_command
 
-from handlers.admin import (
-    admin_help,
-)
+from handlers.admin import admin_help
 
 from handlers.pricing import (
     set_price,
@@ -38,10 +37,14 @@ from handlers.trending import (
     chain_selected,
     contract_received,
     duration_selected,
+    payment_started,
+    transaction_hash_received,
+    cancel_payment,
     trend_cancel,
     SELECT_CHAIN,
     ENTER_CONTRACT,
     SELECT_DURATION,
+    ENTER_TX_HASH,
 )
 
 
@@ -80,6 +83,7 @@ async def help_command(
     await update.message.reply_text(
         "🏛️ *THE BLOCK ROOM*\n\n"
         "📈 /trend — List a token on trending\n"
+        "💰 /prices — View trending packages\n"
         "💬 /support — Contact support\n"
         "❓ /help — Show help",
         parse_mode="Markdown",
@@ -197,12 +201,20 @@ def main():
 
         states={
 
+            # -----------------------------------------------
+            # SELECT CHAIN
+            # -----------------------------------------------
+
             SELECT_CHAIN: [
                 CallbackQueryHandler(
                     chain_selected,
                     pattern=r"^trend_chain_|^trend_cancel$",
                 )
             ],
+
+            # -----------------------------------------------
+            # ENTER CONTRACT
+            # -----------------------------------------------
 
             ENTER_CONTRACT: [
                 MessageHandler(
@@ -212,11 +224,38 @@ def main():
                 )
             ],
 
+            # -----------------------------------------------
+            # SELECT DURATION
+            # -----------------------------------------------
+
             SELECT_DURATION: [
                 CallbackQueryHandler(
                     duration_selected,
-                    pattern=r"^trend_duration_|^trend_cancel_duration$",
+                    pattern=(
+                        r"^trend_duration_"
+                        r"|^trend_cancel_duration$"
+                    ),
                 )
+            ],
+
+            # -----------------------------------------------
+            # PAYMENT / TX HASH
+            # -----------------------------------------------
+
+            ENTER_TX_HASH: [
+                CallbackQueryHandler(
+                    payment_started,
+                    pattern=r"^trend_paid$",
+                ),
+                CallbackQueryHandler(
+                    cancel_payment,
+                    pattern=r"^trend_cancel_payment$",
+                ),
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    transaction_hash_received,
+                ),
             ],
         },
 
