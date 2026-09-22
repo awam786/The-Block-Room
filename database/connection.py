@@ -179,29 +179,96 @@ async def create_tables():
                 order_id BIGINT REFERENCES orders(id),
                 used_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS buybot_settings (
+                group_id BIGINT PRIMARY KEY,
+
+                enabled BOOLEAN DEFAULT FALSE,
+
+                min_buy_usd NUMERIC(30, 10)
+                    DEFAULT 0,
+
+                show_new_holder BOOLEAN
+                    DEFAULT TRUE,
+
+                show_market_cap BOOLEAN
+                    DEFAULT TRUE,
+
+                show_spent_amount BOOLEAN
+                    DEFAULT TRUE,
+
+                show_received_amount BOOLEAN
+                    DEFAULT TRUE,
+
+                custom_media_type TEXT,
+
+                custom_media_file_id TEXT,
+
+                buy_emoji TEXT
+                    DEFAULT '🟢',
+
+                spent_emoji TEXT
+                    DEFAULT '🔀',
+
+                received_emoji TEXT
+                    DEFAULT '🪙',
+
+                holder_emoji TEXT
+                    DEFAULT '👤',
+
+                market_cap_emoji TEXT
+                    DEFAULT '💎',
+
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW(),
+
+                updated_at TIMESTAMPTZ
+                    DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS buybot_buttons (
+                id BIGSERIAL PRIMARY KEY,
+
+                group_id BIGINT NOT NULL,
+
+                position INTEGER NOT NULL,
+
+                button_name TEXT NOT NULL,
+
+                button_url TEXT NOT NULL,
+
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW(),
+
+                UNIQUE (
+                    group_id,
+                    position
+                )
+            );
             """
         )
-
-        # ----------------------------------------------------
-        # DATABASE UPGRADES FOR EXISTING INSTALLATIONS
-        # ----------------------------------------------------
 
         await conn.execute(
             """
             ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS buys_24h BIGINT DEFAULT 0;
+            ADD COLUMN IF NOT EXISTS buys_24h
+                BIGINT DEFAULT 0;
 
             ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS sells_24h BIGINT DEFAULT 0;
+            ADD COLUMN IF NOT EXISTS sells_24h
+                BIGINT DEFAULT 0;
 
             ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS rank INTEGER;
+            ADD COLUMN IF NOT EXISTS rank
+                INTEGER;
 
             ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS paid_promotion BOOLEAN DEFAULT TRUE;
+            ADD COLUMN IF NOT EXISTS paid_promotion
+                BOOLEAN DEFAULT TRUE;
 
             ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ;
+            ADD COLUMN IF NOT EXISTS last_activity_at
+                TIMESTAMPTZ;
 
             ALTER TABLE trends
             ADD COLUMN IF NOT EXISTS last_volume_24h
@@ -212,10 +279,6 @@ async def create_tables():
                 TIMESTAMPTZ;
             """
         )
-
-        # ----------------------------------------------------
-        # DEFAULT TRENDING SETTINGS
-        # ----------------------------------------------------
 
         await conn.executemany(
             """
@@ -262,10 +325,6 @@ async def create_tables():
                 ),
             ],
         )
-
-        # ----------------------------------------------------
-        # DEFAULT PRICES
-        # ----------------------------------------------------
 
         await conn.executemany(
             """
