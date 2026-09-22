@@ -61,10 +61,15 @@ from services.trending_engine import (
     trending_engine_worker,
 )
 
+from services.trending_publisher import (
+    trending_publisher_worker,
+)
+
 
 payment_worker_task = None
 trend_activation_worker_task = None
 trending_engine_worker_task = None
+trending_publisher_worker_task = None
 
 
 async def post_init(
@@ -73,6 +78,7 @@ async def post_init(
     global payment_worker_task
     global trend_activation_worker_task
     global trending_engine_worker_task
+    global trending_publisher_worker_task
 
     await init_db()
 
@@ -108,6 +114,16 @@ async def post_init(
         "Trending engine launched."
     )
 
+    trending_publisher_worker_task = (
+        asyncio.create_task(
+            trending_publisher_worker()
+        )
+    )
+
+    print(
+        "Trending publisher launched."
+    )
+
 
 async def post_shutdown(
     application: Application,
@@ -115,11 +131,13 @@ async def post_shutdown(
     global payment_worker_task
     global trend_activation_worker_task
     global trending_engine_worker_task
+    global trending_publisher_worker_task
 
     tasks = [
         payment_worker_task,
         trend_activation_worker_task,
         trending_engine_worker_task,
+        trending_publisher_worker_task,
     ]
 
     for task in tasks:
@@ -140,6 +158,7 @@ async def post_shutdown(
     payment_worker_task = None
     trend_activation_worker_task = None
     trending_engine_worker_task = None
+    trending_publisher_worker_task = None
 
     await close_db()
 
@@ -173,6 +192,10 @@ def main():
         .build()
     )
 
+    # ========================================================
+    # BASIC COMMANDS
+    # ========================================================
+
     application.add_handler(
         CommandHandler(
             "start",
@@ -194,6 +217,10 @@ def main():
         )
     )
 
+    # ========================================================
+    # PRICING
+    # ========================================================
+
     application.add_handler(
         CommandHandler(
             [
@@ -212,6 +239,10 @@ def main():
             show_prices,
         )
     )
+
+    # ========================================================
+    # PAYMENT WALLETS
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -241,6 +272,10 @@ def main():
             show_wallets,
         )
     )
+
+    # ========================================================
+    # TRENDING CONVERSATION
+    # ========================================================
 
     trend_conversation = ConversationHandler(
 
@@ -311,6 +346,10 @@ def main():
     application.add_handler(
         trend_conversation
     )
+
+    # ========================================================
+    # START BOT
+    # ========================================================
 
     print(
         "The Block Room is starting..."
