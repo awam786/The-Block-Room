@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -10,13 +12,14 @@ from telegram.ext import (
 
 from handlers.start import register_user
 from services.token_validator import validate_token
+from database.connection import get_pool
 
 
 # ============================================================
 # CONVERSATION STATES
 # ============================================================
 
-SELECT_CHAIN, ENTER_CONTRACT = range(2)
+SELECT_CHAIN, ENTER_CONTRACT, SELECT_DURATION = range(3)
 
 
 # ============================================================
@@ -41,11 +44,7 @@ async def trend_start(
 ):
     await register_user(update)
 
-    # Clear any previous trending session
-    context.user_data.pop("trend_chain", None)
-    context.user_data.pop("trend_chain_name", None)
-    context.user_data.pop("trend_contract", None)
-    context.user_data.pop("token_info", None)
+    context.user_data.clear()
 
     keyboard = [
         [
@@ -82,7 +81,8 @@ async def trend_start(
 
     await update.message.reply_text(
         "📈 *LIST ON TRENDING*\n\n"
-        "Select the blockchain/network where your token is deployed:",
+        "Select the blockchain/network where your token "
+        "is deployed:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -103,7 +103,6 @@ async def chain_selected(
 
     data = query.data
 
-    # Cancel
     if data == "trend_cancel":
         context.user_data.clear()
 
@@ -113,7 +112,6 @@ async def chain_selected(
 
         return ConversationHandler.END
 
-    # Extract chain
     chain_key = data.replace(
         "trend_chain_",
         "",
@@ -126,9 +124,10 @@ async def chain_selected(
 
         return ConversationHandler.END
 
-    # Save chain information
     context.user_data["trend_chain"] = chain_key
-    context.user_data["trend_chain_name"] = CHAINS[chain_key]
+    context.user_data["trend_chain_name"] = CHAINS[
+        chain_key
+    ]
 
     await query.edit_message_text(
         f"✅ *{CHAINS[chain_key]} selected.*\n\n"
@@ -141,7 +140,7 @@ async def chain_selected(
 
 
 # ============================================================
-# CONTRACT ADDRESS
+# CONTRACT VALIDATION
 # ============================================================
 
 async def contract_received(
@@ -152,7 +151,6 @@ async def contract_received(
         update.message.text or ""
     ).strip()
 
-    # Empty message
     if not contract:
         await update.message.reply_text(
             "❌ Please send a contract address."
@@ -160,11 +158,9 @@ async def contract_received(
 
         return ENTER_CONTRACT
 
-    # Basic length protection
     if len(contract) > 200:
         await update.message.reply_text(
-            "❌ That contract address is too long.\n\n"
-            "Please send only the contract address."
+            "❌ That contract address is too long."
         )
 
         return ENTER_CONTRACT
@@ -177,7 +173,6 @@ async def contract_received(
         "trend_chain_name"
     )
 
-    # Session expired
     if not chain:
         await update.message.reply_text(
             "❌ Your trending session has expired.\n\n"
@@ -186,25 +181,22 @@ async def contract_received(
 
         return ConversationHandler.END
 
-    # Checking message
     checking_message = await update.message.reply_text(
         "🔎 *Checking token...*\n\n"
         "⏳ Please wait.",
         parse_mode="Markdown",
     )
 
-    # ========================================================
-    # REAL TOKEN VALIDATION
-    # ========================================================
-
-    result = await validate_token(
-        chain,
-        contract,
-    )
-
-    # ========================================================
-    # INVALID TOKEN
-    # ========================================================
+    try:
+        result = await validate_token(
+            chain,
+            contract,
+        )
+    except Exception:
+        result = {
+            "valid": False,
+            "reason": "Token verification service is temporarily unavailable.",
+        }
 
     if not result.get("valid"):
         reason = result.get(
@@ -224,38 +216,20 @@ async def contract_received(
 
         return ENTER_CONTRACT
 
-    # ========================================================
-    # SAVE TOKEN INFORMATION
-    # ========================================================
-
     context.user_data["trend_contract"] = contract
     context.user_data["token_info"] = result
 
-    token_name = (
-        result.get("name")
-        or "Unknown"
-    )
-
-    token_symbol = (
-        result.get("symbol")
-        or "Unknown"
-    )
+    token_name = result.get("name") or "Unknown"
+    token_symbol = result.get("symbol") or "Unknown"
 
     launched = result.get(
         "launched",
         False,
     )
 
-    pair = result.get(
-        "pair"
-    ) or {}
-
-    # ========================================================
-    # LIVE / LAUNCHED TOKEN
-    # ========================================================
+    pair = result.get("pair") or {}
 
     if launched:
-
         liquidity = pair.get(
             "liquidity_usd",
             0,
@@ -281,10 +255,6 @@ async def contract_received(
             "Unknown",
         )
 
-        pair_url = pair.get(
-            "url"
-        )
-
         message = (
             "✅ *TOKEN VERIFIED*\n\n"
             f"🌐 Network: {chain_name}\n"
@@ -295,79 +265,208 @@ async def contract_received(
             f"💎 Market Cap: ${float(market_cap):,.2f}\n"
             f"📈 24h Change: {float(price_change):+.2f}%\n"
             f"🔄 DEX: {dex}\n\n"
-        )
-
-        if pair_url:
-            message += (
-                f"🔗 [View Market Pair]({pair_url})\n\n"
-            )
-
-        message += (
-            "🟢 *Trading is live.*\n\n"
-            "Next we'll show the available trending "
-            "durations."
+            "🟢 *Trading is live.*"
         )
 
         await checking_message.edit_text(
             message,
             parse_mode="Markdown",
-            disable_web_page_preview=True,
         )
 
-    # ========================================================
-    # PRE-LAUNCH TOKEN
-    # ========================================================
-
     else:
-
-        message = (
+        await checking_message.edit_text(
             "✅ *TOKEN FOUND — PRE-LAUNCH*\n\n"
             f"🌐 Network: {chain_name}\n"
             f"🪙 Name: {token_name}\n"
             f"🔤 Symbol: {token_symbol}\n\n"
             "🟡 No live DEX trading pair was found yet.\n\n"
-            "You can reserve a trending position before "
-            "launch. We'll monitor the token and activate "
-            "the trend automatically when trading becomes live.\n\n"
-            "Next we'll show the available trending "
-            "durations."
-        )
-
-        await checking_message.edit_text(
-            message,
+            "You can reserve trending before launch. "
+            "The system will monitor for the token to go live.",
             parse_mode="Markdown",
         )
+
+    # Show duration options
+    await send_duration_options(
+        update,
+        context,
+    )
+
+    return SELECT_DURATION
+
+
+# ============================================================
+# DURATION OPTIONS
+# ============================================================
+
+async def send_duration_options(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    pool = get_pool()
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT duration_hours, price_usdt
+            FROM pricing
+            ORDER BY duration_hours
+            """
+        )
+
+    if not rows:
+        await update.message.reply_text(
+            "❌ No trending packages are currently available.\n\n"
+            "Please contact support."
+        )
+
+        return
+
+    buttons = []
+
+    for row in rows:
+        hours = row["duration_hours"]
+        price = Decimal(str(row["price_usdt"]))
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"⏱ {hours}h — {price:g} USDT",
+                    callback_data=f"trend_duration_{hours}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="trend_cancel_duration",
+            )
+        ]
+    )
+
+    await update.message.reply_text(
+        "💰 *CHOOSE YOUR TRENDING PACKAGE*\n\n"
+        "Select how long you want your token to remain "
+        "on The Block Room trending:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# DURATION SELECTED
+# ============================================================
+
+async def duration_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data == "trend_cancel_duration":
+        context.user_data.clear()
+
+        await query.edit_message_text(
+            "❌ Trending request cancelled."
+        )
+
+        return ConversationHandler.END
+
+    if not data.startswith("trend_duration_"):
+        await query.edit_message_text(
+            "❌ Invalid duration selection."
+        )
+
+        return SELECT_DURATION
+
+    try:
+        duration = int(
+            data.replace(
+                "trend_duration_",
+                "",
+            )
+        )
+    except ValueError:
+        await query.edit_message_text(
+            "❌ Invalid duration."
+        )
+
+        return SELECT_DURATION
+
+    pool = get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT duration_hours, price_usdt
+            FROM pricing
+            WHERE duration_hours = $1
+            """,
+            duration,
+        )
+
+    if not row:
+        await query.edit_message_text(
+            "❌ This package is no longer available.\n\n"
+            "Please start again with /trend."
+        )
+
+        return ConversationHandler.END
+
+    price = Decimal(
+        str(row["price_usdt"])
+    )
+
+    context.user_data["trend_duration"] = duration
+    context.user_data["trend_price"] = price
+
+    token_info = context.user_data.get(
+        "token_info",
+        {},
+    )
+
+    token_name = token_info.get(
+        "name",
+        "Unknown",
+    )
+
+    token_symbol = token_info.get(
+        "symbol",
+        "Unknown",
+    )
+
+    chain_name = context.user_data.get(
+        "trend_chain_name",
+        "Unknown",
+    )
+
+    await query.edit_message_text(
+        "🧾 *TRENDING ORDER*\n\n"
+        f"🪙 Token: {token_name} ({token_symbol})\n"
+        f"🌐 Network: {chain_name}\n"
+        f"⏱ Duration: {duration} hours\n"
+        f"💰 Price: {price:g} USDT\n\n"
+        "Your order information has been prepared.\n\n"
+        "💳 The next step is payment.",
+        parse_mode="Markdown",
+    )
 
     return ConversationHandler.END
 
 
 # ============================================================
-# CANCEL COMMAND
+# CANCEL
 # ============================================================
 
 async def trend_cancel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    context.user_data.pop(
-        "trend_chain",
-        None,
-    )
-
-    context.user_data.pop(
-        "trend_chain_name",
-        None,
-    )
-
-    context.user_data.pop(
-        "trend_contract",
-        None,
-    )
-
-    context.user_data.pop(
-        "token_info",
-        None,
-    )
+    context.user_data.clear()
 
     await update.message.reply_text(
         "❌ Trending request cancelled."
