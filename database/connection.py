@@ -9,6 +9,9 @@ _pool = None
 async def init_db():
     global _pool
 
+    if _pool is not None:
+        return
+
     if not DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL is not configured."
@@ -18,34 +21,16 @@ async def init_db():
         DATABASE_URL,
         min_size=1,
         max_size=10,
+        command_timeout=30,
     )
 
-    await create_tables()
+    async with _pool.acquire() as connection:
 
+        # =========================================================
+        # USERS
+        # =========================================================
 
-async def close_db():
-    global _pool
-
-    if _pool:
-        await _pool.close()
-        _pool = None
-
-
-def get_pool():
-    if _pool is None:
-        raise RuntimeError(
-            "Database pool has not been initialized."
-        )
-
-    return _pool
-
-
-async def create_tables():
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-
-        await conn.execute(
+        await connection.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id BIGSERIAL PRIMARY KEY,
@@ -53,134 +38,364 @@ async def create_tables():
                 username TEXT,
                 first_name TEXT,
                 last_name TEXT,
-                is_admin BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+            """
+        )
 
+        # =========================================================
+        # GROUPS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS groups (
                 id BIGSERIAL PRIMARY KEY,
                 telegram_id BIGINT UNIQUE NOT NULL,
                 title TEXT,
                 username TEXT,
+                type TEXT,
                 is_active BOOLEAN DEFAULT TRUE,
-                buybot_enabled BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+            """
+        )
 
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
+        # =========================================================
+        # PRICING
+        # =========================================================
 
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS pricing (
-                duration_hours INTEGER PRIMARY KEY,
-                price_usdt NUMERIC(20, 6) NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS wallets (
-                chain TEXT PRIMARY KEY,
-                address TEXT,
-                token_symbol TEXT DEFAULT 'USDT',
-                is_active BOOLEAN DEFAULT TRUE,
+                id BIGSERIAL PRIMARY KEY,
+                duration_hours INTEGER UNIQUE NOT NULL,
+                price NUMERIC(30, 10) NOT NULL,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+            """
+        )
 
+        # =========================================================
+        # PAYMENT WALLETS
+        # =========================================================
+
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payment_wallets (
+                id BIGSERIAL PRIMARY KEY,
+                chain TEXT UNIQUE NOT NULL,
+                wallet_address TEXT NOT NULL,
+                enabled BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
+        # =========================================================
+        # ORDERS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS orders (
                 id BIGSERIAL PRIMARY KEY,
-                order_number TEXT UNIQUE NOT NULL,
-                user_id BIGINT REFERENCES users(id),
-                chain TEXT NOT NULL,
-                contract_address TEXT NOT NULL,
-                token_name TEXT,
-                token_symbol TEXT,
-                duration_hours INTEGER NOT NULL,
-                amount_usdt NUMERIC(20, 6) NOT NULL,
-                status TEXT NOT NULL DEFAULT 'PENDING',
-                payment_chain TEXT,
-                payment_tx_hash TEXT UNIQUE,
-                payment_verified BOOLEAN DEFAULT FALSE,
-                waiting_for_launch BOOLEAN DEFAULT FALSE,
-                starts_at TIMESTAMPTZ,
-                expires_at TIMESTAMPTZ,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
 
+                order_id TEXT UNIQUE,
+
+                user_id BIGINT,
+
+                chain TEXT NOT NULL,
+
+                token_address TEXT NOT NULL,
+
+                token_name TEXT,
+
+                token_symbol TEXT,
+
+                duration_hours INTEGER NOT NULL,
+
+                amount NUMERIC(30, 10) NOT NULL,
+
+                payment_wallet TEXT,
+
+                transaction_hash TEXT,
+
+                status TEXT NOT NULL DEFAULT
+                    'PAYMENT_PENDING',
+
+                payment_error TEXT,
+
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+                paid_at TIMESTAMPTZ,
+
+                activated_at TIMESTAMPTZ,
+
+                expires_at TIMESTAMPTZ
+            );
+            """
+        )
+
+        # =========================================================
+        # ORDER COMPATIBILITY COLUMNS
+        # =========================================================
+
+        await connection.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+                order_id TEXT;
+            """
+        )
+
+        await connection.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+                user_id BIGINT;
+            """
+        )
+
+        await connection.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+                payment_wallet TEXT;
+            """
+        )
+
+        await connection.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+                payment_error TEXT;
+            """
+        )
+
+        await connection.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+                updated_at TIMESTAMPTZ
+                DEFAULT NOW();
+            """
+        )
+
+        await connection.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+                paid_at TIMESTAMPTZ;
+            """
+        )
+
+        await connection.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+                activated_at TIMESTAMPTZ;
+            """
+        )
+
+        await connection.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+                expires_at TIMESTAMPTZ;
+            """
+        )
+
+        # =========================================================
+        # USED PAYMENT HASHES
+        # =========================================================
+
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS used_payment_hashes (
+                id BIGSERIAL PRIMARY KEY,
+                tx_hash TEXT UNIQUE NOT NULL,
+                order_id TEXT,
+                chain TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
+        # =========================================================
+        # TRENDS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS trends (
                 id BIGSERIAL PRIMARY KEY,
-                order_id BIGINT UNIQUE REFERENCES orders(id),
+
+                order_id TEXT,
+
                 chain TEXT NOT NULL,
-                contract_address TEXT NOT NULL,
+
+                token_address TEXT NOT NULL,
+
                 token_name TEXT,
+
                 token_symbol TEXT,
-                status TEXT NOT NULL DEFAULT 'ACTIVE',
 
-                score NUMERIC(30, 10) DEFAULT 0,
+                pair_address TEXT,
 
-                volume_24h NUMERIC(30, 10) DEFAULT 0,
-                market_cap NUMERIC(30, 10) DEFAULT 0,
-                liquidity NUMERIC(30, 10) DEFAULT 0,
-                price_change_24h NUMERIC(30, 10) DEFAULT 0,
+                dex_url TEXT,
 
-                buys_24h BIGINT DEFAULT 0,
-                sells_24h BIGINT DEFAULT 0,
-
-                rank INTEGER,
+                active BOOLEAN DEFAULT TRUE,
 
                 paid_promotion BOOLEAN DEFAULT TRUE,
 
+                natural_score NUMERIC(30, 10)
+                    DEFAULT 0,
+
+                placement_score NUMERIC(30, 10)
+                    DEFAULT 0,
+
+                rank INTEGER,
+
+                volume_24h NUMERIC(40, 10)
+                    DEFAULT 0,
+
+                liquidity_usd NUMERIC(40, 10)
+                    DEFAULT 0,
+
+                market_cap_usd NUMERIC(40, 10)
+                    DEFAULT 0,
+
+                buy_activity NUMERIC(40, 10)
+                    DEFAULT 0,
+
+                price_momentum NUMERIC(30, 10)
+                    DEFAULT 0,
+
+                recent_activity NUMERIC(30, 10)
+                    DEFAULT 0,
+
                 last_activity_at TIMESTAMPTZ,
-                last_volume_24h NUMERIC(30, 10) DEFAULT 0,
 
-                inactivity_started_at TIMESTAMPTZ,
+                started_at TIMESTAMPTZ
+                    DEFAULT NOW(),
 
-                started_at TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ,
 
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW(),
 
+                updated_at TIMESTAMPTZ
+                    DEFAULT NOW()
+            );
+            """
+        )
+
+        # =========================================================
+        # TICKETS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS tickets (
                 id BIGSERIAL PRIMARY KEY,
-                ticket_number TEXT UNIQUE NOT NULL,
-                user_id BIGINT REFERENCES users(id),
-                subject TEXT,
-                status TEXT NOT NULL DEFAULT 'OPEN',
-                admin_message TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
 
+                ticket_id TEXT UNIQUE NOT NULL,
+
+                user_id BIGINT,
+
+                status TEXT DEFAULT 'OPEN',
+
+                subject TEXT,
+
+                description TEXT,
+
+                admin_message TEXT,
+
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW(),
+
+                updated_at TIMESTAMPTZ
+                    DEFAULT NOW(),
+
+                closed_at TIMESTAMPTZ
+            );
+            """
+        )
+
+        # =========================================================
+        # DISCOUNTS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS discounts (
                 id BIGSERIAL PRIMARY KEY,
-                duration_hours INTEGER NOT NULL,
-                discounted_price_usdt NUMERIC(20, 6) NOT NULL,
-                starts_at TIMESTAMPTZ DEFAULT NOW(),
-                expires_at TIMESTAMPTZ NOT NULL,
-                promo_text TEXT,
-                promo_image TEXT,
-                is_active BOOLEAN DEFAULT TRUE
-            );
 
+                duration_hours INTEGER UNIQUE NOT NULL,
+
+                discount_price NUMERIC(30, 10)
+                    NOT NULL,
+
+                active BOOLEAN DEFAULT TRUE,
+
+                promo_text TEXT,
+
+                promo_media_type TEXT,
+
+                promo_media_id TEXT,
+
+                starts_at TIMESTAMPTZ
+                    DEFAULT NOW(),
+
+                expires_at TIMESTAMPTZ,
+
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW(),
+
+                updated_at TIMESTAMPTZ
+                    DEFAULT NOW()
+            );
+            """
+        )
+
+        # =========================================================
+        # BROADCAST TARGETS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS broadcast_targets (
                 id BIGSERIAL PRIMARY KEY,
-                target_type TEXT NOT NULL,
+
                 target_id BIGINT UNIQUE NOT NULL,
+
+                target_type TEXT NOT NULL,
+
                 title TEXT,
-                is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
 
-            CREATE TABLE IF NOT EXISTS used_payment_hashes (
-                tx_hash TEXT PRIMARY KEY,
-                chain TEXT NOT NULL,
-                order_id BIGINT REFERENCES orders(id),
-                used_at TIMESTAMPTZ DEFAULT NOW()
-            );
+                active BOOLEAN DEFAULT TRUE,
 
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW(),
+
+                updated_at TIMESTAMPTZ
+                    DEFAULT NOW()
+            );
+            """
+        )
+
+        # =========================================================
+        # BUYBOT SETTINGS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS buybot_settings (
                 group_id BIGINT PRIMARY KEY,
 
@@ -189,64 +404,72 @@ async def create_tables():
                 min_buy_usd NUMERIC(30, 10)
                     DEFAULT 0,
 
-                show_new_holder BOOLEAN
-                    DEFAULT TRUE,
+                media_type TEXT,
 
-                show_market_cap BOOLEAN
-                    DEFAULT TRUE,
+                media_id TEXT,
 
-                show_spent_amount BOOLEAN
-                    DEFAULT TRUE,
+                alert_title TEXT,
 
-                show_received_amount BOOLEAN
-                    DEFAULT TRUE,
+                alert_template TEXT,
 
-                custom_media_type TEXT,
+                buy_emoji TEXT,
 
-                custom_media_file_id TEXT,
+                new_holder_emoji TEXT,
 
-                buy_emoji TEXT
-                    DEFAULT '🟢',
+                market_cap_emoji TEXT,
 
-                spent_emoji TEXT
-                    DEFAULT '🔀',
+                spent_emoji TEXT,
 
-                received_emoji TEXT
-                    DEFAULT '🪙',
+                received_emoji TEXT,
 
-                holder_emoji TEXT
-                    DEFAULT '👤',
-
-                market_cap_emoji TEXT
-                    DEFAULT '💎',
-
-                created_at TIMESTAMPTZ
-                    DEFAULT NOW(),
+                network_emoji TEXT,
 
                 updated_at TIMESTAMPTZ
                     DEFAULT NOW()
             );
+            """
+        )
 
+        # =========================================================
+        # BUYBOT BUTTONS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS buybot_buttons (
                 id BIGSERIAL PRIMARY KEY,
 
                 group_id BIGINT NOT NULL,
 
-                position INTEGER NOT NULL,
-
                 button_name TEXT NOT NULL,
 
                 button_url TEXT NOT NULL,
 
+                position INTEGER DEFAULT 0,
+
                 created_at TIMESTAMPTZ
-                    DEFAULT NOW(),
-
-                UNIQUE (
-                    group_id,
-                    position
-                )
+                    DEFAULT NOW()
             );
+            """
+        )
 
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_buybot_buttons_group
+            ON buybot_buttons (
+                group_id,
+                position
+            );
+            """
+        )
+
+        # =========================================================
+        # BUYBOT TOKENS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS buybot_tokens (
                 id BIGSERIAL PRIMARY KEY,
 
@@ -266,9 +489,11 @@ async def create_tables():
 
                 enabled BOOLEAN DEFAULT TRUE,
 
-                created_at TIMESTAMPTZ DEFAULT NOW(),
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW(),
 
-                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ
+                    DEFAULT NOW(),
 
                 UNIQUE (
                     group_id,
@@ -276,7 +501,36 @@ async def create_tables():
                     contract_address
                 )
             );
+            """
+        )
 
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_buybot_tokens_group
+            ON buybot_tokens (
+                group_id
+            );
+            """
+        )
+
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_buybot_tokens_chain_address
+            ON buybot_tokens (
+                chain,
+                contract_address
+            );
+            """
+        )
+
+        # =========================================================
+        # BUYBOT EVENTS
+        # =========================================================
+
+        await connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS buybot_events (
                 id BIGSERIAL PRIMARY KEY,
 
@@ -296,7 +550,8 @@ async def create_tables():
 
                 received_amount NUMERIC(40, 10),
 
-                created_at TIMESTAMPTZ DEFAULT NOW(),
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW(),
 
                 UNIQUE (
                     group_id,
@@ -308,43 +563,7 @@ async def create_tables():
             """
         )
 
-        await conn.execute(
-            """
-            ALTER TABLE groups
-            ADD COLUMN IF NOT EXISTS updated_at
-                TIMESTAMPTZ DEFAULT NOW();
-
-            ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS buys_24h
-                BIGINT DEFAULT 0;
-
-            ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS sells_24h
-                BIGINT DEFAULT 0;
-
-            ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS rank
-                INTEGER;
-
-            ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS paid_promotion
-                BOOLEAN DEFAULT TRUE;
-
-            ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS last_activity_at
-                TIMESTAMPTZ;
-
-            ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS last_volume_24h
-                NUMERIC(30, 10) DEFAULT 0;
-
-            ALTER TABLE trends
-            ADD COLUMN IF NOT EXISTS inactivity_started_at
-                TIMESTAMPTZ;
-            """
-        )
-
-        await conn.execute(
+        await connection.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_buybot_events_group_created
@@ -355,7 +574,7 @@ async def create_tables():
             """
         )
 
-        await conn.execute(
+        await connection.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_buybot_events_token
@@ -366,66 +585,129 @@ async def create_tables():
             """
         )
 
-        await conn.executemany(
-            """
-            INSERT INTO settings (
-                key,
-                value
-            )
-            VALUES ($1, $2)
-            ON CONFLICT (key)
-            DO NOTHING
-            """,
-            [
-                (
-                    "payment_tolerance_usdt",
-                    "0.10",
-                ),
-                (
-                    "payment_confirmations",
-                    "3",
-                ),
-                (
-                    "trending_inactivity_minutes",
-                    "10",
-                ),
-                (
-                    "trending_update_seconds",
-                    "30",
-                ),
-                (
-                    "paid_start_rank_low_mc",
-                    "5",
-                ),
-                (
-                    "paid_start_rank_high_mc",
-                    "3",
-                ),
-                (
-                    "paid_high_mc_threshold",
-                    "100000",
-                ),
-                (
-                    "paid_top_mc_threshold",
-                    "500000",
-                ),
-            ],
-        )
+        # =========================================================
+        # DEFAULT PRICES
+        # =========================================================
 
-        await conn.executemany(
+        await connection.execute(
             """
             INSERT INTO pricing (
                 duration_hours,
-                price_usdt
+                price
             )
-            VALUES ($1, $2)
-            ON CONFLICT (duration_hours)
-            DO NOTHING
-            """,
-            [
+            VALUES
                 (2, 110),
                 (6, 330),
                 (12, 600),
-                (24, 1000),
-            ],
+                (24, 1000)
+            ON CONFLICT (
+                duration_hours
+            )
+            DO NOTHING;
+            """
+        )
+
+        # =========================================================
+        # DEFAULT BUYBOT SETTINGS
+        # =========================================================
+
+        await connection.execute(
+            """
+            INSERT INTO buybot_settings (
+                group_id,
+                enabled,
+                min_buy_usd
+            )
+            SELECT
+                g.telegram_id,
+                FALSE,
+                0
+            FROM groups g
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM buybot_settings bs
+                WHERE bs.group_id =
+                    g.telegram_id
+            );
+            """
+        )
+
+        # =========================================================
+        # INDEXES
+        # =========================================================
+
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_orders_user
+            ON orders (
+                user_id
+            );
+            """
+        )
+
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_orders_status
+            ON orders (
+                status
+            );
+            """
+        )
+
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_orders_tx_hash
+            ON orders (
+                transaction_hash
+            );
+            """
+        )
+
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_trends_active
+            ON trends (
+                active,
+                rank
+            );
+            """
+        )
+
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_tickets_user_status
+            ON tickets (
+                user_id,
+                status
+            );
+            """
+        )
+
+    print(
+        "Database schema initialized successfully."
+    )
+
+
+async def get_pool():
+    if _pool is None:
+        await init_db()
+
+    return _pool
+
+
+async def close_db():
+    global _pool
+
+    if _pool is not None:
+        await _pool.close()
+
+        _pool = None
+
+        print(
+            "Database pool closed."
         )
