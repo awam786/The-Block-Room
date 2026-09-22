@@ -34,6 +34,12 @@ from handlers.wallets import (
     show_wallets,
 )
 
+from handlers.buybot import (
+    activate_buybot,
+    remove_buybot,
+    build_buybot_conversation,
+)
+
 from handlers.trending import (
     trend_start,
     chain_selected,
@@ -175,6 +181,7 @@ async def help_command(
         "🏛️ *THE BLOCK ROOM*\n\n"
         "📈 /trend — List a token on trending\n"
         "💰 /prices — View trending packages\n"
+        "🤖 /buybot — Manage BuyBot in a group\n"
         "💬 /support — Contact support\n"
         "❓ /help — Show help",
         parse_mode="Markdown",
@@ -214,6 +221,24 @@ def main():
         CommandHandler(
             "adminhelp",
             admin_help,
+        )
+    )
+
+    # ========================================================
+    # MAIN ADMIN — BUYBOT ACTIVATION
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
+            "activebuybot",
+            activate_buybot,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removebuybot",
+            remove_buybot,
         )
     )
 
@@ -271,6 +296,14 @@ def main():
             "wallets",
             show_wallets,
         )
+    )
+
+    # ========================================================
+    # BUYBOT SETTINGS
+    # ========================================================
+
+    application.add_handler(
+        build_buybot_conversation()
     )
 
     # ========================================================
