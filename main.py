@@ -5,10 +5,10 @@ from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    ContextTypes,
+    ConversationHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
     filters,
 )
 
@@ -37,6 +37,7 @@ from handlers.wallets import (
 from handlers.buybot import (
     activate_buybot,
     remove_buybot,
+    list_tokens,
     build_buybot_conversation,
 )
 
@@ -177,11 +178,15 @@ async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     await update.message.reply_text(
         "🏛️ *THE BLOCK ROOM*\n\n"
         "📈 /trend — List a token on trending\n"
         "💰 /prices — View trending packages\n"
         "🤖 /buybot — Manage BuyBot in a group\n"
+        "➕ /add — Add BuyBot token\n"
+        "➖ /remove — Remove BuyBot token\n"
+        "📋 /tokens — View monitored tokens\n"
         "💬 /support — Contact support\n"
         "❓ /help — Show help",
         parse_mode="Markdown",
@@ -200,7 +205,7 @@ def main():
     )
 
     # ========================================================
-    # BASIC COMMANDS
+    # BASIC
     # ========================================================
 
     application.add_handler(
@@ -299,7 +304,26 @@ def main():
     )
 
     # ========================================================
-    # BUYBOT SETTINGS
+    # BUYBOT TOKEN LIST
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
+            "tokens",
+            list_tokens,
+        )
+    )
+
+    # ========================================================
+    # BUYBOT SETTINGS + TOKEN MANAGEMENT
+    #
+    # Includes:
+    # /buybot
+    # /buybotsettings
+    # /add
+    # /remove
+    #
+    # And all BuyBot inline menus.
     # ========================================================
 
     application.add_handler(
@@ -322,42 +346,48 @@ def main():
         states={
 
             SELECT_CHAIN: [
+
                 CallbackQueryHandler(
                     chain_selected,
                     pattern=(
                         r"^trend_chain_"
                         r"|^trend_cancel$"
                     ),
-                )
+                ),
             ],
 
             ENTER_CONTRACT: [
+
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
                     contract_received,
-                )
+                ),
             ],
 
             SELECT_DURATION: [
+
                 CallbackQueryHandler(
                     duration_selected,
                     pattern=(
                         r"^trend_duration_"
                         r"|^trend_cancel_duration$"
                     ),
-                )
+                ),
             ],
 
             ENTER_TX_HASH: [
+
                 CallbackQueryHandler(
                     payment_started,
                     pattern=r"^trend_paid$",
                 ),
+
                 CallbackQueryHandler(
                     cancel_payment,
                     pattern=r"^trend_cancel_payment$",
                 ),
+
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
@@ -370,7 +400,7 @@ def main():
             CommandHandler(
                 "cancel",
                 trend_cancel,
-            )
+            ),
         ],
 
         allow_reentry=True,
@@ -381,7 +411,7 @@ def main():
     )
 
     # ========================================================
-    # START BOT
+    # START
     # ========================================================
 
     print(
