@@ -1,3 +1,5 @@
+import asyncio
+
 from telegram import Update
 
 from telegram.ext import (
@@ -47,6 +49,17 @@ from handlers.trending import (
     ENTER_TX_HASH,
 )
 
+from services.payment_worker import (
+    payment_worker,
+)
+
+
+# ============================================================
+# BACKGROUND TASK
+# ============================================================
+
+payment_worker_task = None
+
 
 # ============================================================
 # DATABASE LIFECYCLE
@@ -55,16 +68,40 @@ from handlers.trending import (
 async def post_init(
     application: Application,
 ):
+    global payment_worker_task
+
     await init_db()
 
     print(
         "PostgreSQL connected successfully."
     )
 
+    payment_worker_task = asyncio.create_task(
+        payment_worker()
+    )
+
+    print(
+        "Payment worker launched."
+    )
+
 
 async def post_shutdown(
     application: Application,
 ):
+    global payment_worker_task
+
+    if payment_worker_task:
+
+        payment_worker_task.cancel()
+
+        try:
+            await payment_worker_task
+
+        except asyncio.CancelledError:
+            pass
+
+        payment_worker_task = None
+
     await close_db()
 
     print(
@@ -201,20 +238,12 @@ def main():
 
         states={
 
-            # -----------------------------------------------
-            # SELECT CHAIN
-            # -----------------------------------------------
-
             SELECT_CHAIN: [
                 CallbackQueryHandler(
                     chain_selected,
                     pattern=r"^trend_chain_|^trend_cancel$",
                 )
             ],
-
-            # -----------------------------------------------
-            # ENTER CONTRACT
-            # -----------------------------------------------
 
             ENTER_CONTRACT: [
                 MessageHandler(
@@ -223,10 +252,6 @@ def main():
                     contract_received,
                 )
             ],
-
-            # -----------------------------------------------
-            # SELECT DURATION
-            # -----------------------------------------------
 
             SELECT_DURATION: [
                 CallbackQueryHandler(
@@ -237,10 +262,6 @@ def main():
                     ),
                 )
             ],
-
-            # -----------------------------------------------
-            # PAYMENT / TX HASH
-            # -----------------------------------------------
 
             ENTER_TX_HASH: [
                 CallbackQueryHandler(
@@ -274,7 +295,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # START BOT
+    # START
     # --------------------------------------------------------
 
     print(
