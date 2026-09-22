@@ -1,377 +1,440 @@
-from typing import Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from telegram import (
+    Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
 
-from database.connection import get_pool
-from services.buybot_events import BuyEvent
 
+# ============================================================
+# CHAIN CONFIGURATION
+# ============================================================
 
-# =========================================================
-# DEFAULT BUYBOT VALUES
-# =========================================================
-
-DEFAULT_TITLE = "🚨 Fresh Buy"
-
-DEFAULT_TEMPLATE = (
-    "{buy_emoji} *{token_name}* "
-    "({token_symbol})\n\n"
-    "{spent_emoji} Spent: *${spent_usd}*\n"
-    "{received_emoji} Received: "
-    "*{received_amount} {received_symbol}*\n\n"
-    "{holder_emoji} {holder_status}\n"
-    "{market_cap_emoji} Market Cap: *${market_cap}*\n"
-    "{network_emoji} Network: *{chain}*"
-)
-
-DEFAULT_EMOJIS = {
-    "buy_emoji": "🟢",
-    "holder_emoji": "👤",
-    "market_cap_emoji": "💎",
-    "spent_emoji": "💸",
-    "received_emoji": "🪙",
-    "network_emoji": "⛓️",
+CHAIN_CONFIG = {
+    "solana": {
+        "name": "Solana",
+        "explorer": "https://solscan.io/tx/",
+        "address_explorer": "https://solscan.io/account/",
+        "default_emoji": "🟣",
+    },
+    "bnb": {
+        "name": "BNB Smart Chain",
+        "explorer": "https://bscscan.com/tx/",
+        "address_explorer": "https://bscscan.com/address/",
+        "default_emoji": "🟡",
+    },
+    "ethereum": {
+        "name": "Ethereum",
+        "explorer": "https://etherscan.io/tx/",
+        "address_explorer": "https://etherscan.io/address/",
+        "default_emoji": "🔵",
+    },
+    "robinhood": {
+        "name": "Robinhood Chain",
+        "explorer": "https://explorer.mainnet.chain.robinhood.com/tx/",
+        "address_explorer": "https://explorer.mainnet.chain.robinhood.com/address/",
+        "default_emoji": "🔴",
+    },
 }
 
 
-# =========================================================
-# HELPERS
-# =========================================================
+# ============================================================
+# DEFAULT EMOJIS
+# ============================================================
+
+DEFAULT_EMOJIS = {
+    "buy": "🟢",
+    "spent": "💰",
+    "received": "🪙",
+    "holder": "👤",
+    "market_cap": "📊",
+    "network": "🌐",
+    "chart": "📈",
+    "wallet": "👛",
+    "transaction": "🔗",
+}
 
 
-def safe_number(
-    value,
-    decimals: int = 2,
-) -> str:
-    try:
-        number = float(value or 0)
-
-        return f"{number:,.{decimals}f}"
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-        return "0"
-
+# ============================================================
+# SAFE VALUE HELPERS
+# ============================================================
 
 def safe_text(
-    value,
-    fallback: str = "-",
+    value: Any,
+    fallback: str = "",
 ) -> str:
     if value is None:
         return fallback
 
     text = str(value).strip()
 
-    return text or fallback
+    if not text:
+        return fallback
+
+    return text
 
 
-def escape_markdown_v2(
-    text: str,
-) -> str:
-    """
-    Escape Telegram MarkdownV2 special characters.
-    """
-
-    special = (
-        "_",
-        "*",
-        "[",
-        "]",
-        "(",
-        ")",
-        "~",
-        "`",
-        ">",
-        "#",
-        "+",
-        "-",
-        "=",
-        "|",
-        "{",
-        "}",
-        ".",
-        "!",
-    )
-
-    result = str(text)
-
-    for char in special:
-        result = result.replace(
-            char,
-            "\\" + char,
-        )
-
-    return result
-
-
-# =========================================================
-# SETTINGS
-# =========================================================
-
-
-async def get_buybot_settings(
-    group_id: int,
+def safe_decimal(
+    value: Any,
 ):
-    pool = await get_pool()
-
-    async with pool.acquire() as connection:
-        return await connection.fetchrow(
-            """
-            SELECT
-                group_id,
-                enabled,
-                min_buy_usd,
-                media_type,
-                media_id,
-                alert_title,
-                alert_template,
-                buy_emoji,
-                new_holder_emoji,
-                market_cap_emoji,
-                spent_emoji,
-                received_emoji,
-                network_emoji
-            FROM buybot_settings
-            WHERE group_id = $1;
-            """,
-            group_id,
-        )
-
-
-async def get_custom_buttons(
-    group_id: int,
-):
-    pool = await get_pool()
-
-    async with pool.acquire() as connection:
-        rows = await connection.fetch(
-            """
-            SELECT
-                button_name,
-                button_url,
-                position
-            FROM buybot_buttons
-            WHERE group_id = $1
-            ORDER BY position ASC, id ASC
-            LIMIT 3;
-            """,
-            group_id,
-        )
-
-    return rows
-
-
-# =========================================================
-# TEMPLATE VALUES
-# =========================================================
-
-
-def event_values(
-    event: BuyEvent,
-    settings,
-):
-    holder_status = (
-        "New Holder"
-        if event.is_new_holder
-        else "Existing Holder"
-    )
-
-    values = {
-        "token_name": safe_text(
-            event.token_name,
-            "Unknown Token",
-        ),
-        "token_symbol": safe_text(
-            event.token_symbol,
-            "?",
-        ),
-        "chain": safe_text(
-            event.chain,
-            "Unknown",
-        ).upper(),
-
-        "spent_usd": safe_number(
-            event.spent_amount_usd,
-            2,
-        ),
-
-        "spent_native": safe_number(
-            event.spent_native_amount,
-            6,
-        ),
-
-        "native_symbol": safe_text(
-            event.spent_native_symbol,
-            "",
-        ),
-
-        "received_amount": safe_number(
-            event.received_amount,
-            2,
-        ),
-
-        "received_symbol": safe_text(
-            event.received_symbol
-            or event.token_symbol,
-            "?",
-        ),
-
-        "market_cap": safe_number(
-            event.market_cap_usd,
-            0,
-        ),
-
-        "buyer": safe_text(
-            event.buyer_address,
-            "-",
-        ),
-
-        "holder_status": holder_status,
-
-        "buy_emoji": (
-            settings["buy_emoji"]
-            or DEFAULT_EMOJIS["buy_emoji"]
-        ),
-
-        "holder_emoji": (
-            settings["new_holder_emoji"]
-            or DEFAULT_EMOJIS["holder_emoji"]
-        ),
-
-        "market_cap_emoji": (
-            settings["market_cap_emoji"]
-            or DEFAULT_EMOJIS[
-                "market_cap_emoji"
-            ]
-        ),
-
-        "spent_emoji": (
-            settings["spent_emoji"]
-            or DEFAULT_EMOJIS["spent_emoji"]
-        ),
-
-        "received_emoji": (
-            settings["received_emoji"]
-            or DEFAULT_EMOJIS[
-                "received_emoji"
-            ]
-        ),
-
-        "network_emoji": (
-            settings["network_emoji"]
-            or DEFAULT_EMOJIS[
-                "network_emoji"
-            ]
-        ),
-    }
-
-    return values
-
-
-# =========================================================
-# RENDER ALERT TEXT
-# =========================================================
-
-
-def render_alert_text(
-    event: BuyEvent,
-    settings,
-) -> str:
-    title = (
-        settings["alert_title"]
-        or DEFAULT_TITLE
-    )
-
-    template = (
-        settings["alert_template"]
-        or DEFAULT_TEMPLATE
-    )
-
-    values = event_values(
-        event,
-        settings,
-    )
+    if value is None:
+        return None
 
     try:
-        body = template.format(
-            **values
+        return Decimal(
+            str(value)
+        )
+    except (
+        InvalidOperation,
+        ValueError,
+        TypeError,
+    ):
+        return None
+
+
+def format_number(
+    value: Any,
+    decimals: int = 2,
+) -> str:
+    number = safe_decimal(value)
+
+    if number is None:
+        return "N/A"
+
+    if number >= Decimal("1000000000"):
+        return (
+            f"{number / Decimal('1000000000'):.2f}B"
         )
 
-    except Exception as exc:
-        print(
-            "BuyBot template error: "
-            f"{exc}"
+    if number >= Decimal("1000000"):
+        return (
+            f"{number / Decimal('1000000'):.2f}M"
         )
 
-        body = DEFAULT_TEMPLATE.format(
-            **values
+    if number >= Decimal("1000"):
+        return (
+            f"{number / Decimal('1000'):.2f}K"
         )
+
+    return f"{number:,.{decimals}f}"
+
+
+def format_usd(
+    value: Any,
+) -> str:
+    number = safe_decimal(value)
+
+    if number is None:
+        return "N/A"
+
+    if number >= Decimal("1000000000"):
+        return (
+            f"${number / Decimal('1000000000'):.2f}B"
+        )
+
+    if number >= Decimal("1000000"):
+        return (
+            f"${number / Decimal('1000000'):.2f}M"
+        )
+
+    if number >= Decimal("1000"):
+        return (
+            f"${number / Decimal('1000'):.2f}K"
+        )
+
+    if number < Decimal("0.01"):
+        return f"${number:.6f}"
+
+    return f"${number:,.2f}"
+
+
+def format_token_amount(
+    value: Any,
+    symbol: str,
+) -> str:
+    number = safe_decimal(value)
+
+    if number is None:
+        return f"N/A {symbol}"
+
+    if number >= Decimal("1000000"):
+        amount = (
+            f"{number / Decimal('1000000'):.2f}M"
+        )
+    elif number >= Decimal("1000"):
+        amount = (
+            f"{number / Decimal('1000'):.2f}K"
+        )
+    elif number >= Decimal("1"):
+        amount = f"{number:,.2f}"
+    elif number >= Decimal("0.01"):
+        amount = f"{number:.4f}"
+    else:
+        amount = f"{number:.8f}"
+
+    return f"{amount} {symbol}"
+
+
+def short_address(
+    address: Any,
+    left: int = 6,
+    right: int = 5,
+) -> str:
+    address = safe_text(
+        address,
+        "Unknown",
+    )
+
+    if len(address) <= (
+        left + right + 3
+    ):
+        return address
 
     return (
-        f"*{title}*\n\n"
-        f"{body}"
+        f"{address[:left]}"
+        f"..."
+        f"{address[-right:]}"
     )
 
 
-# =========================================================
-# AUTOMATIC BUTTONS
-# =========================================================
+# ============================================================
+# CHAIN HELPERS
+# ============================================================
+
+def normalize_chain(
+    chain: Any,
+) -> str:
+    value = safe_text(
+        chain
+    ).lower()
+
+    aliases = {
+        "sol": "solana",
+        "solana": "solana",
+        "bnb": "bnb",
+        "bsc": "bnb",
+        "binance": "bnb",
+        "ethereum": "ethereum",
+        "eth": "ethereum",
+        "robinhood": "robinhood",
+        "robinhood chain": "robinhood",
+    }
+
+    return aliases.get(
+        value,
+        value,
+    )
 
 
-def automatic_buttons(
-    event: BuyEvent,
+def chain_name(
+    chain: Any,
+) -> str:
+    normalized = normalize_chain(
+        chain
+    )
+
+    config = CHAIN_CONFIG.get(
+        normalized
+    )
+
+    if config:
+        return config["name"]
+
+    return safe_text(
+        chain,
+        "Unknown",
+    )
+
+
+def chain_emoji(
+    chain: Any,
+    custom_emoji: Any = None,
+) -> str:
+    custom = safe_text(
+        custom_emoji
+    )
+
+    if custom:
+        return custom
+
+    normalized = normalize_chain(
+        chain
+    )
+
+    config = CHAIN_CONFIG.get(
+        normalized
+    )
+
+    if config:
+        return config[
+            "default_emoji"
+        ]
+
+    return "🌐"
+
+
+# ============================================================
+# URL BUILDERS
+# ============================================================
+
+def transaction_url(
+    chain: Any,
+    tx_hash: Any,
+) -> str | None:
+    tx_hash = safe_text(
+        tx_hash
+    )
+
+    if not tx_hash:
+        return None
+
+    normalized = normalize_chain(
+        chain
+    )
+
+    config = CHAIN_CONFIG.get(
+        normalized
+    )
+
+    if not config:
+        return None
+
+    return (
+        config["explorer"]
+        + tx_hash
+    )
+
+
+def address_url(
+    chain: Any,
+    address: Any,
+) -> str | None:
+    address = safe_text(
+        address
+    )
+
+    if not address:
+        return None
+
+    normalized = normalize_chain(
+        chain
+    )
+
+    config = CHAIN_CONFIG.get(
+        normalized
+    )
+
+    if not config:
+        return None
+
+    return (
+        config["address_explorer"]
+        + address
+    )
+
+
+# ============================================================
+# DEFAULT BUTTONS
+# ============================================================
+
+def build_automatic_buttons(
+    chain: Any,
+    tx_hash: Any = None,
+    token_address: Any = None,
+    dex_url: Any = None,
+    trending_url: Any = None,
 ):
     buttons = []
 
-    if event.dex_url:
+    tx_url = transaction_url(
+        chain,
+        tx_hash,
+    )
+
+    if tx_url:
         buttons.append(
             InlineKeyboardButton(
-                "📊 Chart",
-                url=event.dex_url,
+                "🔎 TX",
+                url=tx_url,
             )
         )
 
-    if event.buy_url:
+    dex_url = safe_text(
+        dex_url
+    )
+
+    if dex_url:
         buttons.append(
             InlineKeyboardButton(
-                "🛒 Buy",
-                url=event.buy_url,
+                "📈 Chart",
+                url=dex_url,
             )
         )
 
-    if event.trending_url:
+    token_address = safe_text(
+        token_address
+    )
+
+    if token_address:
+        normalized = normalize_chain(
+            chain
+        )
+
+        if normalized in CHAIN_CONFIG:
+            buttons.append(
+                InlineKeyboardButton(
+                    "🪙 Token",
+                    url=address_url(
+                        normalized,
+                        token_address,
+                    ),
+                )
+            )
+
+    trending_url = safe_text(
+        trending_url
+    )
+
+    if trending_url:
         buttons.append(
             InlineKeyboardButton(
                 "🔥 Trending",
-                url=event.trending_url,
+                url=trending_url,
             )
         )
 
     return buttons
 
 
-# =========================================================
+# ============================================================
 # CUSTOM BUTTONS
-# =========================================================
+# ============================================================
 
-
-def custom_buttons(
-    rows,
+def build_custom_buttons(
+    button_rows,
 ):
     buttons = []
 
-    for row in rows[:3]:
-        name = str(
-            row["button_name"]
-        ).strip()
+    if not button_rows:
+        return buttons
 
-        url = str(
-            row["button_url"]
-        ).strip()
+    for row in button_rows:
+        try:
+            name = safe_text(
+                row["button_name"]
+            )
+
+            url = safe_text(
+                row["button_url"]
+            )
+
+        except (
+            KeyError,
+            TypeError,
+        ):
+            continue
 
         if not name or not url:
             continue
@@ -386,200 +449,647 @@ def custom_buttons(
     return buttons
 
 
-# =========================================================
-# KEYBOARD
-# =========================================================
-
-
-async def build_buybot_keyboard(
-    event: BuyEvent,
-    group_id: int,
+def arrange_buttons(
+    automatic_buttons,
+    custom_buttons,
 ):
-    custom = await get_custom_buttons(
-        group_id
-    )
+    """
+    Creates a clean two-column keyboard.
 
-    auto_buttons = automatic_buttons(
-        event
-    )
+    Automatic buttons are shown first.
+    Custom group buttons follow them.
+    """
 
-    custom_buttons_list = custom_buttons(
-        custom
-    )
+    all_buttons = []
 
-    all_buttons = (
-        auto_buttons
-        + custom_buttons_list
-    )
+    for button in (
+        automatic_buttons
+        or []
+    ):
+        if button:
+            all_buttons.append(
+                button
+            )
 
-    if not all_buttons:
+    for button in (
+        custom_buttons
+        or []
+    ):
+        if button:
+            all_buttons.append(
+                button
+            )
+
+    keyboard = []
+
+    current_row = []
+
+    for button in all_buttons:
+        current_row.append(
+            button
+        )
+
+        if len(current_row) == 2:
+            keyboard.append(
+                current_row
+            )
+            current_row = []
+
+    if current_row:
+        keyboard.append(
+            current_row
+        )
+
+    if not keyboard:
         return None
-
-    rows = []
-
-    # Automatic buttons
-    if auto_buttons:
-        rows.append(
-            auto_buttons
-        )
-
-    # Custom buttons
-    for button in custom_buttons_list:
-        rows.append(
-            [button]
-        )
 
     return InlineKeyboardMarkup(
-        rows
+        keyboard
     )
 
 
-# =========================================================
-# MEDIA INFORMATION
-# =========================================================
+# ============================================================
+# EMOJI SETTINGS
+# ============================================================
+
+def get_emoji(
+    settings,
+    column_name: str,
+    fallback_key: str,
+) -> str:
+    if settings:
+        try:
+            value = settings[
+                column_name
+            ]
+        except (
+            KeyError,
+            TypeError,
+        ):
+            value = None
+
+        value = safe_text(
+            value
+        )
+
+        if value:
+            return value
+
+    return DEFAULT_EMOJIS[
+        fallback_key
+    ]
 
 
-async def get_buybot_media(
-    group_id: int,
+# ============================================================
+# TITLE
+# ============================================================
+
+def build_title(
+    settings,
+    token_name: str,
+    token_symbol: str,
 ):
-    settings = await get_buybot_settings(
-        group_id
+    custom_title = ""
+
+    if settings:
+        try:
+            custom_title = safe_text(
+                settings["alert_title"]
+            )
+        except (
+            KeyError,
+            TypeError,
+        ):
+            custom_title = ""
+
+    if custom_title:
+        title = custom_title
+    else:
+        title = "🚀 NEW BUY"
+
+    token_name = safe_text(
+        token_name,
+        "Unknown Token",
     )
 
-    if not settings:
-        return None, None
-
-    media_type = settings[
-        "media_type"
-    ]
-
-    media_id = settings[
-        "media_id"
-    ]
-
-    if not media_type or not media_id:
-        return None, None
+    token_symbol = safe_text(
+        token_symbol,
+        "TOKEN",
+    )
 
     return (
-        media_type,
-        media_id,
+        f"{title}\n"
+        f"💎 {token_name} "
+        f"(${token_symbol})"
     )
 
 
-# =========================================================
-# COMPLETE RENDER
-# =========================================================
+# ============================================================
+# DEFAULT ALERT
+# ============================================================
 
-
-async def render_buybot_alert(
-    event: BuyEvent,
+def build_default_alert(
+    *,
+    settings,
+    chain,
+    token_name,
+    token_symbol,
+    spent_usd=None,
+    spent_native=None,
+    native_symbol=None,
+    received_amount=None,
+    buyer=None,
+    market_cap=None,
+    tx_hash=None,
 ):
-    """
-    Returns everything required to send
-    a BuyBot alert.
-
-    Result:
-
-        {
-            "text": "...",
-            "reply_markup": ...,
-            "media_type": "...",
-            "media_id": "..."
-        }
-    """
-
-    settings = await get_buybot_settings(
-        event.group_id
-    )
-
-    if not settings:
-        return None
-
-    if not settings["enabled"]:
-        return None
-
-    # -----------------------------------------------------
-    # Minimum buy filter
-    # -----------------------------------------------------
-
-    minimum = float(
-        settings["min_buy_usd"]
-        or 0
-    )
-
-    spent_usd = float(
-        event.spent_amount_usd
-        or 0
-    )
-
-    if (
-        minimum > 0
-        and spent_usd < minimum
-    ):
-        return None
-
-    # -----------------------------------------------------
-    # Text
-    # -----------------------------------------------------
-
-    text = render_alert_text(
-        event,
+    buy_emoji = get_emoji(
         settings,
+        "buy_emoji",
+        "buy",
     )
 
-    # -----------------------------------------------------
-    # Buttons
-    # -----------------------------------------------------
-
-    keyboard = await build_buybot_keyboard(
-        event,
-        event.group_id,
+    spent_emoji = get_emoji(
+        settings,
+        "spent_emoji",
+        "spent",
     )
 
-    # -----------------------------------------------------
-    # Media
-    # -----------------------------------------------------
+    received_emoji = get_emoji(
+        settings,
+        "received_emoji",
+        "received",
+    )
 
-    media_type = settings[
-        "media_type"
+    holder_emoji = get_emoji(
+        settings,
+        "new_holder_emoji",
+        "holder",
+    )
+
+    market_cap_emoji = get_emoji(
+        settings,
+        "market_cap_emoji",
+        "market_cap",
+    )
+
+    network_emoji = get_emoji(
+        settings,
+        "network_emoji",
+        "network",
+    )
+
+    title = build_title(
+        settings,
+        token_name,
+        token_symbol,
+    )
+
+    token_symbol = safe_text(
+        token_symbol,
+        "TOKEN",
+    )
+
+    chain_text = chain_name(
+        chain
+    )
+
+    lines = [
+        title,
+        "",
+        f"{buy_emoji} BUY DETECTED",
     ]
 
-    media_id = settings[
-        "media_id"
-    ]
+    # --------------------------------------------------------
+    # SPENT
+    # --------------------------------------------------------
 
-    return {
-        "text": text,
-        "reply_markup": keyboard,
-        "media_type": media_type,
-        "media_id": media_id,
+    if spent_usd is not None:
+        lines.append(
+            f"{spent_emoji} Spent: "
+            f"{format_usd(spent_usd)}"
+        )
+
+    elif (
+        spent_native is not None
+        and native_symbol
+    ):
+        lines.append(
+            f"{spent_emoji} Spent: "
+            f"{format_token_amount("
+            f"spent_native, "
+            f"native_symbol"
+            f")}"
+        )
+
+    else:
+        lines.append(
+            f"{spent_emoji} Spent: "
+            f"Amount unavailable"
+        )
+
+    # --------------------------------------------------------
+    # RECEIVED
+    # --------------------------------------------------------
+
+    if received_amount is not None:
+        lines.append(
+            f"{received_emoji} Received: "
+            f"{format_token_amount("
+            f"received_amount, "
+            f"token_symbol"
+            f")}"
+        )
+
+    # --------------------------------------------------------
+    # HOLDER
+    # --------------------------------------------------------
+
+    if buyer:
+        lines.append(
+            f"{holder_emoji} Holder: "
+            f"{short_address(buyer)}"
+        )
+
+    # --------------------------------------------------------
+    # MARKET CAP
+    # --------------------------------------------------------
+
+    if market_cap is not None:
+        lines.append(
+            f"{market_cap_emoji} Market Cap: "
+            f"{format_usd(market_cap)}"
+        )
+
+    # --------------------------------------------------------
+    # NETWORK
+    # --------------------------------------------------------
+
+    lines.append(
+        f"{network_emoji} Network: "
+        f"{chain_text}"
+    )
+
+    # --------------------------------------------------------
+    # TRANSACTION
+    # --------------------------------------------------------
+
+    if tx_hash:
+        lines.append(
+            f"{DEFAULT_EMOJIS['transaction']} "
+            f"Transaction: "
+            f"{short_address(tx_hash, 8, 6)}"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+# ============================================================
+# CUSTOM TEMPLATE
+# ============================================================
+
+def apply_template(
+    template: str,
+    *,
+    token_name,
+    token_symbol,
+    spent_usd=None,
+    spent_native=None,
+    native_symbol=None,
+    received_amount=None,
+    buyer=None,
+    market_cap=None,
+    chain=None,
+    tx_hash=None,
+):
+    values = {
+        "{name}": safe_text(
+            token_name,
+            "Unknown Token",
+        ),
+        "{symbol}": safe_text(
+            token_symbol,
+            "TOKEN",
+        ),
+        "{spent}": (
+            format_usd(
+                spent_usd
+            )
+            if spent_usd is not None
+            else (
+                format_token_amount(
+                    spent_native,
+                    native_symbol,
+                )
+                if (
+                    spent_native is not None
+                    and native_symbol
+                )
+                else "N/A"
+            )
+        ),
+        "{received}": (
+            format_token_amount(
+                received_amount,
+                safe_text(
+                    token_symbol,
+                    "TOKEN",
+                ),
+            )
+            if received_amount is not None
+            else "N/A"
+        ),
+        "{buyer}": short_address(
+            buyer
+        ),
+        "{market_cap}": format_usd(
+            market_cap
+        ),
+        "{chain}": chain_name(
+            chain
+        ),
+        "{tx}": short_address(
+            tx_hash,
+            8,
+            6,
+        ),
     }
 
+    result = template
 
-# =========================================================
-# SIMPLE PREVIEW DATA
-# =========================================================
+    for key, value in values.items():
+        result = result.replace(
+            key,
+            str(value),
+        )
+
+    return result
 
 
-def preview_event():
-    return BuyEvent(
-        group_id=0,
-        chain="bnb",
-        tx_hash="preview",
-        token_address="0x0000000000000000000000000000000000000000",
-        token_name="Example Token",
-        token_symbol="EXM",
-        buyer_address="0x1234...5678",
-        spent_amount_usd=125.40,
-        spent_native_amount=0.21,
-        spent_native_symbol="BNB",
-        received_amount=12450,
-        received_symbol="EXM",
-        market_cap_usd=84500,
-        is_new_holder=True,
-        dex_url="https://dexscreener.com/",
-        buy_url="https://dexscreener.com/",
-        trending_url=None,
-        block_number=None,
-        timestamp=None,
+# ============================================================
+# FINAL RENDER FUNCTION
+# ============================================================
+
+def render_buy_alert(
+    *,
+    settings,
+    chain,
+    token_name,
+    token_symbol,
+    spent_usd=None,
+    spent_native=None,
+    native_symbol=None,
+    received_amount=None,
+    buyer=None,
+    market_cap=None,
+    tx_hash=None,
+):
+    """
+    Main renderer used by every BuyBot detector.
+
+    Supported template variables:
+
+        {name}
+        {symbol}
+        {spent}
+        {received}
+        {buyer}
+        {market_cap}
+        {chain}
+        {tx}
+    """
+
+    template = ""
+
+    if settings:
+        try:
+            template = safe_text(
+                settings[
+                    "alert_template"
+                ]
+            )
+        except (
+            KeyError,
+            TypeError,
+        ):
+            template = ""
+
+    if template:
+        return (
+            f"{build_title("
+            f"settings, "
+            f"token_name, "
+            f"token_symbol"
+            f")}\n\n"
+            f"{apply_template("
+            f"template, "
+            f"token_name=token_name, "
+            f"token_symbol=token_symbol, "
+            f"spent_usd=spent_usd, "
+            f"spent_native=spent_native, "
+            f"native_symbol=native_symbol, "
+            f"received_amount=received_amount, "
+            f"buyer=buyer, "
+            f"market_cap=market_cap, "
+            f"chain=chain, "
+            f"tx_hash=tx_hash"
+            f")}"
+        )
+
+    return build_default_alert(
+        settings=settings,
+        chain=chain,
+        token_name=token_name,
+        token_symbol=token_symbol,
+        spent_usd=spent_usd,
+        spent_native=spent_native,
+        native_symbol=native_symbol,
+        received_amount=received_amount,
+        buyer=buyer,
+        market_cap=market_cap,
+        tx_hash=tx_hash,
     )
+
+
+# ============================================================
+# COMPLETE KEYBOARD
+# ============================================================
+
+def build_buy_alert_keyboard(
+    *,
+    chain,
+    tx_hash=None,
+    token_address=None,
+    dex_url=None,
+    trending_url=None,
+    custom_buttons=None,
+):
+    automatic = build_automatic_buttons(
+        chain=chain,
+        tx_hash=tx_hash,
+        token_address=token_address,
+        dex_url=dex_url,
+        trending_url=trending_url,
+    )
+
+    custom = build_custom_buttons(
+        custom_buttons
+    )
+
+    return arrange_buttons(
+        automatic,
+        custom,
+    )
+
+
+# ============================================================
+# MEDIA + MESSAGE SENDER
+# ============================================================
+
+async def send_buy_alert(
+    *,
+    bot: Bot,
+    group_id: int,
+    settings,
+    chain,
+    token_name,
+    token_symbol,
+    spent_usd=None,
+    spent_native=None,
+    native_symbol=None,
+    received_amount=None,
+    buyer=None,
+    market_cap=None,
+    tx_hash=None,
+    token_address=None,
+    dex_url=None,
+    trending_url=None,
+    custom_buttons=None,
+):
+    """
+    Central Telegram sender.
+
+    Supports:
+        - normal text
+        - photo
+        - animation/GIF
+        - video
+        - automatic buttons
+        - custom buttons
+    """
+
+    text = render_buy_alert(
+        settings=settings,
+        chain=chain,
+        token_name=token_name,
+        token_symbol=token_symbol,
+        spent_usd=spent_usd,
+        spent_native=spent_native,
+        native_symbol=native_symbol,
+        received_amount=received_amount,
+        buyer=buyer,
+        market_cap=market_cap,
+        tx_hash=tx_hash,
+    )
+
+    keyboard = build_buy_alert_keyboard(
+        chain=chain,
+        tx_hash=tx_hash,
+        token_address=token_address,
+        dex_url=dex_url,
+        trending_url=trending_url,
+        custom_buttons=custom_buttons,
+    )
+
+    media_type = None
+    media_id = None
+
+    if settings:
+        try:
+            media_type = safe_text(
+                settings[
+                    "media_type"
+                ]
+            )
+        except (
+            KeyError,
+            TypeError,
+        ):
+            media_type = None
+
+        try:
+            media_id = safe_text(
+                settings[
+                    "media_id"
+                ]
+            )
+        except (
+            KeyError,
+            TypeError,
+        ):
+            media_id = None
+
+    if media_type == "photo" and media_id:
+        await bot.send_photo(
+            chat_id=group_id,
+            photo=media_id,
+            caption=text,
+            reply_markup=keyboard,
+        )
+
+        return
+
+    if (
+        media_type == "animation"
+        and media_id
+    ):
+        await bot.send_animation(
+            chat_id=group_id,
+            animation=media_id,
+            caption=text,
+            reply_markup=keyboard,
+        )
+
+        return
+
+    if media_type == "video" and media_id:
+        await bot.send_video(
+            chat_id=group_id,
+            video=media_id,
+            caption=text,
+            reply_markup=keyboard,
+        )
+
+        return
+
+    await bot.send_message(
+        chat_id=group_id,
+        text=text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+# ============================================================
+# PUBLIC EXPORTS
+# ============================================================
+
+__all__ = [
+    "CHAIN_CONFIG",
+    "DEFAULT_EMOJIS",
+    "normalize_chain",
+    "chain_name",
+    "transaction_url",
+    "address_url",
+    "format_number",
+    "format_usd",
+    "format_token_amount",
+    "short_address",
+    "build_automatic_buttons",
+    "build_custom_buttons",
+    "arrange_buttons",
+    "render_buy_alert",
+    "build_buy_alert_keyboard",
+    "send_buy_alert",
+]
