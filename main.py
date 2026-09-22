@@ -57,24 +57,22 @@ from services.trend_activation_worker import (
     trend_activation_worker,
 )
 
+from services.trending_engine import (
+    trending_engine_worker,
+)
 
-# ============================================================
-# BACKGROUND TASKS
-# ============================================================
 
 payment_worker_task = None
 trend_activation_worker_task = None
+trending_engine_worker_task = None
 
-
-# ============================================================
-# DATABASE LIFECYCLE
-# ============================================================
 
 async def post_init(
     application: Application,
 ):
     global payment_worker_task
     global trend_activation_worker_task
+    global trending_engine_worker_task
 
     await init_db()
 
@@ -100,36 +98,48 @@ async def post_init(
         "Trend activation worker launched."
     )
 
+    trending_engine_worker_task = (
+        asyncio.create_task(
+            trending_engine_worker()
+        )
+    )
+
+    print(
+        "Trending engine launched."
+    )
+
 
 async def post_shutdown(
     application: Application,
 ):
     global payment_worker_task
     global trend_activation_worker_task
+    global trending_engine_worker_task
 
-    if payment_worker_task:
+    tasks = [
+        payment_worker_task,
+        trend_activation_worker_task,
+        trending_engine_worker_task,
+    ]
 
-        payment_worker_task.cancel()
+    for task in tasks:
 
-        try:
-            await payment_worker_task
+        if task:
+            task.cancel()
 
-        except asyncio.CancelledError:
-            pass
+    for task in tasks:
 
-        payment_worker_task = None
+        if task:
 
-    if trend_activation_worker_task:
+            try:
+                await task
 
-        trend_activation_worker_task.cancel()
+            except asyncio.CancelledError:
+                pass
 
-        try:
-            await trend_activation_worker_task
-
-        except asyncio.CancelledError:
-            pass
-
-        trend_activation_worker_task = None
+    payment_worker_task = None
+    trend_activation_worker_task = None
+    trending_engine_worker_task = None
 
     await close_db()
 
@@ -137,10 +147,6 @@ async def post_shutdown(
         "PostgreSQL connection closed."
     )
 
-
-# ============================================================
-# HELP
-# ============================================================
 
 async def help_command(
     update: Update,
@@ -156,10 +162,6 @@ async def help_command(
     )
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
 
     application = (
@@ -170,10 +172,6 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-
-    # --------------------------------------------------------
-    # BASIC COMMANDS
-    # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
@@ -196,10 +194,6 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # PRICING
-    # --------------------------------------------------------
-
     application.add_handler(
         CommandHandler(
             [
@@ -218,10 +212,6 @@ def main():
             show_prices,
         )
     )
-
-    # --------------------------------------------------------
-    # PAYMENT WALLETS
-    # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
@@ -252,10 +242,6 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # TRENDING CONVERSATION
-    # --------------------------------------------------------
-
     trend_conversation = ConversationHandler(
 
         entry_points=[
@@ -267,20 +253,15 @@ def main():
 
         states={
 
-            # -----------------------------------------------
-            # SELECT CHAIN
-            # -----------------------------------------------
-
             SELECT_CHAIN: [
                 CallbackQueryHandler(
                     chain_selected,
-                    pattern=r"^trend_chain_|^trend_cancel$",
+                    pattern=(
+                        r"^trend_chain_"
+                        r"|^trend_cancel$"
+                    ),
                 )
             ],
-
-            # -----------------------------------------------
-            # ENTER CONTRACT
-            # -----------------------------------------------
 
             ENTER_CONTRACT: [
                 MessageHandler(
@@ -289,10 +270,6 @@ def main():
                     contract_received,
                 )
             ],
-
-            # -----------------------------------------------
-            # SELECT DURATION
-            # -----------------------------------------------
 
             SELECT_DURATION: [
                 CallbackQueryHandler(
@@ -303,10 +280,6 @@ def main():
                     ),
                 )
             ],
-
-            # -----------------------------------------------
-            # PAYMENT / TX HASH
-            # -----------------------------------------------
 
             ENTER_TX_HASH: [
                 CallbackQueryHandler(
@@ -339,20 +312,12 @@ def main():
         trend_conversation
     )
 
-    # --------------------------------------------------------
-    # START BOT
-    # --------------------------------------------------------
-
     print(
         "The Block Room is starting..."
     )
 
     application.run_polling()
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
