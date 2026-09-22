@@ -276,6 +276,35 @@ async def create_tables():
                     contract_address
                 )
             );
+
+            CREATE TABLE IF NOT EXISTS buybot_events (
+                id BIGSERIAL PRIMARY KEY,
+
+                group_id BIGINT NOT NULL,
+
+                chain TEXT NOT NULL,
+
+                tx_hash TEXT NOT NULL,
+
+                token_address TEXT NOT NULL,
+
+                token_symbol TEXT,
+
+                buyer_address TEXT,
+
+                spent_amount_usd NUMERIC(30, 10),
+
+                received_amount NUMERIC(40, 10),
+
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+
+                UNIQUE (
+                    group_id,
+                    chain,
+                    tx_hash,
+                    token_address
+                )
+            );
             """
         )
 
@@ -312,6 +341,28 @@ async def create_tables():
             ALTER TABLE trends
             ADD COLUMN IF NOT EXISTS inactivity_started_at
                 TIMESTAMPTZ;
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_buybot_events_group_created
+            ON buybot_events (
+                group_id,
+                created_at DESC
+            );
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_buybot_events_token
+            ON buybot_events (
+                chain,
+                token_address
+            );
             """
         )
 
