@@ -53,12 +53,17 @@ from services.payment_worker import (
     payment_worker,
 )
 
+from services.trend_activation_worker import (
+    trend_activation_worker,
+)
+
 
 # ============================================================
-# BACKGROUND TASK
+# BACKGROUND TASKS
 # ============================================================
 
 payment_worker_task = None
+trend_activation_worker_task = None
 
 
 # ============================================================
@@ -69,6 +74,7 @@ async def post_init(
     application: Application,
 ):
     global payment_worker_task
+    global trend_activation_worker_task
 
     await init_db()
 
@@ -84,11 +90,22 @@ async def post_init(
         "Payment worker launched."
     )
 
+    trend_activation_worker_task = (
+        asyncio.create_task(
+            trend_activation_worker()
+        )
+    )
+
+    print(
+        "Trend activation worker launched."
+    )
+
 
 async def post_shutdown(
     application: Application,
 ):
     global payment_worker_task
+    global trend_activation_worker_task
 
     if payment_worker_task:
 
@@ -101,6 +118,18 @@ async def post_shutdown(
             pass
 
         payment_worker_task = None
+
+    if trend_activation_worker_task:
+
+        trend_activation_worker_task.cancel()
+
+        try:
+            await trend_activation_worker_task
+
+        except asyncio.CancelledError:
+            pass
+
+        trend_activation_worker_task = None
 
     await close_db()
 
@@ -238,12 +267,20 @@ def main():
 
         states={
 
+            # -----------------------------------------------
+            # SELECT CHAIN
+            # -----------------------------------------------
+
             SELECT_CHAIN: [
                 CallbackQueryHandler(
                     chain_selected,
                     pattern=r"^trend_chain_|^trend_cancel$",
                 )
             ],
+
+            # -----------------------------------------------
+            # ENTER CONTRACT
+            # -----------------------------------------------
 
             ENTER_CONTRACT: [
                 MessageHandler(
@@ -252,6 +289,10 @@ def main():
                     contract_received,
                 )
             ],
+
+            # -----------------------------------------------
+            # SELECT DURATION
+            # -----------------------------------------------
 
             SELECT_DURATION: [
                 CallbackQueryHandler(
@@ -262,6 +303,10 @@ def main():
                     ),
                 )
             ],
+
+            # -----------------------------------------------
+            # PAYMENT / TX HASH
+            # -----------------------------------------------
 
             ENTER_TX_HASH: [
                 CallbackQueryHandler(
@@ -295,7 +340,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # START
+    # START BOT
     # --------------------------------------------------------
 
     print(
