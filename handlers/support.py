@@ -1,5 +1,4 @@
-import re
-from datetime import datetime
+import os
 
 from telegram import (
     Update,
@@ -7,306 +6,192 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.ext import (
-    CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    CommandHandler,
     CallbackQueryHandler,
     filters,
 )
 
-from config import (
-    ADMIN_IDS,
-    ADMIN_GROUP_ID,
-)
-
-from database.connection import (
-    get_pool,
-)
+from config import ADMIN_IDS, ADMIN_GROUP_ID
+from database.connection import get_pool
 
 
-# ============================================================
-# CONVERSATION STATES
-# ============================================================
+# =========================================================
+# STATE
+# =========================================================
 
-SUPPORT_MESSAGE = 1
-
-
-# ============================================================
-# TICKET ID
-# ============================================================
-
-TICKET_PATTERN = re.compile(
-    r"^TK-\d+$",
-    re.IGNORECASE,
-)
+SUPPORT_DESCRIPTION = 1
 
 
-async def generate_ticket_id(
-    connection,
-) -> str:
-    row = await connection.fetchrow(
-        """
-        SELECT
-            COALESCE(
-                MAX(id),
-                0
-            ) + 1 AS next_number
-        FROM tickets
-        """
-    )
-
-    number = int(
-        row["next_number"]
-    )
-
-    return f"TK-{number:06d}"
-
-
-# ============================================================
+# =========================================================
 # ADMIN CHECK
-# ============================================================
+# =========================================================
 
-def is_admin(
-    user_id: int | None,
-) -> bool:
-    if user_id is None:
-        return False
-
+def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ============================================================
+# =========================================================
+# TICKET ID
+# =========================================================
+
+async def generate_ticket_id():
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+        row = await connection.fetchrow(
+            """
+            INSERT INTO tickets (
+                ticket_id,
+                status
+            )
+            VALUES (
+                'TEMP',
+                'TEMP'
+            )
+            RETURNING id
+            """
+        )
+
+        ticket_number = row["id"]
+
+        ticket_id = (
+            f"TK-{ticket_number:06d}"
+        )
+
+        await connection.execute(
+            """
+            UPDATE tickets
+            SET
+                ticket_id = $1,
+                status = 'OPEN'
+            WHERE id = $2
+            """,
+            ticket_id,
+            ticket_number,
+        )
+
+    return ticket_id
+
+
+# =========================================================
 # SUPPORT START
-# ============================================================
+# =========================================================
 
 async def support_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.effective_user:
-        return ConversationHandler.END
+    user = update.effective_user
 
-    if not update.effective_chat:
-        return ConversationHandler.END
-
-    # --------------------------------------------------------
-    # Admin group handling
-    # --------------------------------------------------------
-
-    if (
-        ADMIN_GROUP_ID
-        and str(update.effective_chat.id)
-        == str(ADMIN_GROUP_ID)
-    ):
-        await update.message.reply_text(
-            "🛠️ Admin support commands:\n\n"
-            "/reply TK-000001 Your message\n"
-            "/closeticket TK-000001\n"
-            "/ticket TK-000001\n"
-            "/tickets\n"
-        )
-
+    if not user:
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "🎫 *Support Ticket*\n\n"
-        "Please describe your issue in one message.\n\n"
-        "You can include the relevant details "
-        "needed to understand the problem.\n\n"
-        "Type /cancel to cancel.",
+        "🛠️ *Support*\n\n"
+        "Please describe your issue in detail.\n\n"
+        "If this is about a transaction, include "
+        "the transaction hash, token, network, "
+        "amount, and any other useful details.",
         parse_mode="Markdown",
     )
 
-    return SUPPORT_MESSAGE
+    return SUPPORT_DESCRIPTION
 
 
-# ============================================================
-# SUPPORT MESSAGE
-# ============================================================
+# =========================================================
+# CREATE TICKET
+# =========================================================
 
-async def support_message(
+async def create_ticket(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.effective_user:
-        return ConversationHandler.END
-
-    if not update.message:
-        return ConversationHandler.END
-
     user = update.effective_user
+    message = update.message
 
-    description = (
-        update.message.text
-        or ""
-    ).strip()
+    if not user or not message:
+        return ConversationHandler.END
+
+    description = message.text.strip()
 
     if not description:
-        await update.message.reply_text(
-            "Please describe your issue in text."
+        await message.reply_text(
+            "❌ Please describe your issue."
         )
 
-        return SUPPORT_MESSAGE
+        return SUPPORT_DESCRIPTION
 
-    if len(description) > 5000:
-        await update.message.reply_text(
-            "Your message is too long.\n\n"
-            "Please keep the support description "
-            "under 5,000 characters."
-        )
-
-        return SUPPORT_MESSAGE
+    ticket_id = await generate_ticket_id()
 
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-
-        # ----------------------------------------------------
-        # Register / update user
-        # ----------------------------------------------------
-
         await connection.execute(
             """
-            INSERT INTO users (
-                telegram_id,
-                username,
-                first_name,
-                last_name,
-                updated_at
-            )
-            VALUES (
-                $1,
-                $2,
-                $3,
-                $4,
-                NOW()
-            )
-            ON CONFLICT (
-                telegram_id
-            )
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
+            UPDATE tickets
+            SET
+                user_id = $1,
+                status = 'OPEN',
+                subject = $2,
+                description = $3,
                 updated_at = NOW()
+            WHERE ticket_id = $4
             """,
             user.id,
-            user.username,
-            user.first_name,
-            user.last_name,
-        )
-
-        # ----------------------------------------------------
-        # Check existing open ticket
-        # ----------------------------------------------------
-
-        existing = await connection.fetchrow(
-            """
-            SELECT
-                ticket_id,
-                status
-            FROM tickets
-            WHERE user_id = $1
-              AND status IN (
-                  'OPEN',
-                  'IN_PROGRESS'
-              )
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            user.id,
-        )
-
-        if existing:
-            await update.message.reply_text(
-                "🎫 You already have an active "
-                "support ticket.\n\n"
-                f"Ticket: `{existing['ticket_id']}`\n"
-                f"Status: `{existing['status']}`\n\n"
-                "Please continue in the same ticket "
-                "instead of creating another one.",
-                parse_mode="Markdown",
-            )
-
-            return ConversationHandler.END
-
-        # ----------------------------------------------------
-        # Create ticket
-        # ----------------------------------------------------
-
-        ticket_id = await generate_ticket_id(
-            connection
-        )
-
-        subject = description[:120]
-
-        await connection.execute(
-            """
-            INSERT INTO tickets (
-                ticket_id,
-                user_id,
-                status,
-                subject,
-                description
-            )
-            VALUES (
-                $1,
-                $2,
-                'OPEN',
-                $3,
-                $4
-            )
-            """,
-            ticket_id,
-            user.id,
-            subject,
+            "Customer Support",
             description,
+            ticket_id,
         )
 
-    # --------------------------------------------------------
-    # User confirmation
-    # --------------------------------------------------------
-
-    await update.message.reply_text(
+    await message.reply_text(
         "🎫 *Support ticket created*\n\n"
-        f"Ticket ID: `{ticket_id}`\n"
-        "Status: `OPEN`\n\n"
+        f"Ticket ID: `{ticket_id}`\n\n"
         "Your request has been forwarded to "
-        "the support team for review.\n\n"
-        "You can use /ticket to check its status.",
+        "the support team.\n\n"
+        "Please keep this ticket ID for reference.",
         parse_mode="Markdown",
     )
 
-    # --------------------------------------------------------
-    # Forward to admin group
-    # --------------------------------------------------------
-
     await forward_ticket_to_admin(
-        update=update,
-        ticket_id=ticket_id,
-        description=description,
+        update,
+        ticket_id,
+        description,
     )
 
     return ConversationHandler.END
 
 
-# ============================================================
-# FORWARD TICKET TO ADMIN
-# ============================================================
+# =========================================================
+# FORWARD TO ADMIN GROUP
+# =========================================================
 
 async def forward_ticket_to_admin(
     update: Update,
     ticket_id: str,
     description: str,
 ):
+    user = update.effective_user
+
     if not ADMIN_GROUP_ID:
         print(
             "ADMIN_GROUP_ID is not configured."
         )
+
         return
 
-    user = update.effective_user
+    try:
+        admin_group_id = int(
+            ADMIN_GROUP_ID
+        )
+    except ValueError:
+        print(
+            "ADMIN_GROUP_ID is invalid."
+        )
+
+        return
 
     username = (
         f"@{user.username}"
@@ -314,95 +199,74 @@ async def forward_ticket_to_admin(
         else "No username"
     )
 
-    name = (
-        user.full_name
-        if user
-        else "Unknown user"
-    )
-
     text = (
-        "🎫 NEW SUPPORT TICKET\n\n"
-        f"Ticket: {ticket_id}\n"
-        f"User: {name}\n"
-        f"Username: {username}\n"
-        f"Telegram ID: {user.id}\n\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"{description}\n\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "Reply:\n"
-        f"/reply {ticket_id} Your message\n\n"
-        "Close:\n"
-        f"/closeticket {ticket_id}"
+        "🎫 *NEW SUPPORT TICKET*\n\n"
+        f"ID: `{ticket_id}`\n"
+        f"User ID: `{user.id}`\n"
+        f"User: {username}\n"
+        f"Name: {user.full_name}\n\n"
+        "📝 *Issue:*\n"
+        f"{description}"
     )
 
-    keyboard = InlineKeyboardMarkup(
+    keyboard = [
         [
-            [
-                InlineKeyboardButton(
-                    "💬 Reply",
-                    callback_data=(
-                        f"support_reply:{ticket_id}"
-                    ),
+            InlineKeyboardButton(
+                "💬 Reply",
+                callback_data=(
+                    f"ticket_reply:{ticket_id}"
                 ),
-                InlineKeyboardButton(
-                    "🔒 Close",
-                    callback_data=(
-                        f"support_close:{ticket_id}"
-                    ),
+            ),
+            InlineKeyboardButton(
+                "🔒 Close",
+                callback_data=(
+                    f"ticket_close:{ticket_id}"
                 ),
-            ]
-        ]
+            ),
+        ],
+    ]
+
+    from telegram import Bot
+
+    from config import BOT_TOKEN
+
+    bot = Bot(BOT_TOKEN)
+
+    await bot.send_message(
+        chat_id=admin_group_id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
     )
 
-    try:
-        await update.get_bot().send_message(
-            chat_id=int(
-                ADMIN_GROUP_ID
-            ),
-            text=text,
-            reply_markup=keyboard,
-        )
 
-    except Exception as exc:
-        print(
-            "Failed to forward support ticket:",
-            exc,
-        )
-
-
-# ============================================================
+# =========================================================
 # TICKET STATUS
-# ============================================================
+# =========================================================
 
 async def ticket_status(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.effective_user:
+    user = update.effective_user
+
+    if not user:
         return
 
     args = context.args
 
     if not args:
         await update.message.reply_text(
-            "Use:\n"
-            "/ticket TK-000001"
+            "Usage:\n"
+            "`/ticket TK-000001`",
+            parse_mode="Markdown",
         )
 
         return
 
     ticket_id = args[0].upper()
-
-    if not TICKET_PATTERN.match(
-        ticket_id
-    ):
-        await update.message.reply_text(
-            "Invalid ticket ID.\n\n"
-            "Example:\n"
-            "/ticket TK-000001"
-        )
-
-        return
 
     pool = await get_pool()
 
@@ -411,17 +275,19 @@ async def ticket_status(
             """
             SELECT
                 ticket_id,
-                user_id,
                 status,
                 subject,
+                description,
                 admin_message,
                 created_at,
                 updated_at,
                 closed_at
             FROM tickets
             WHERE ticket_id = $1
+              AND user_id = $2
             """,
             ticket_id,
+            user.id,
         )
 
     if not ticket:
@@ -431,179 +297,115 @@ async def ticket_status(
 
         return
 
-    user_id = update.effective_user.id
+    status = ticket["status"]
 
-    if (
-        ticket["user_id"] != user_id
-        and not is_admin(user_id)
-    ):
-        await update.message.reply_text(
-            "❌ You don't have access to this ticket."
-        )
+    status_text = {
+        "OPEN": "🟡 Open",
+        "IN_PROGRESS": "🔵 In Progress",
+        "CLOSED": "⚪ Closed",
+        "SOLVED": "🟢 Solved",
+    }.get(
+        status,
+        status,
+    )
 
-        return
-
-    status = ticket[
-        "status"
-    ]
-
-    response = (
+    text = (
         "🎫 *Ticket Status*\n\n"
         f"ID: `{ticket['ticket_id']}`\n"
-        f"Status: `{status}`\n"
+        f"Status: {status_text}\n"
+        f"Created: {ticket['created_at']}\n"
     )
 
     if ticket["admin_message"]:
-        response += (
-            "\n💬 *Latest support response:*\n"
+        text += (
+            "\n💬 *Admin response:*\n"
             f"{ticket['admin_message']}\n"
         )
 
-    if ticket["closed_at"]:
-        response += (
-            "\n🔒 Ticket closed."
-        )
-
     await update.message.reply_text(
-        response,
+        text,
         parse_mode="Markdown",
     )
 
 
-# ============================================================
-# USER TICKETS
-# ============================================================
+# =========================================================
+# ADMIN REPLY BUTTON
+# =========================================================
 
-async def my_tickets(
+async def admin_ticket_reply_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.effective_user:
-        return
+    query = update.callback_query
 
-    pool = await get_pool()
+    await query.answer()
 
-    async with pool.acquire() as connection:
-        tickets = await connection.fetch(
-            """
-            SELECT
-                ticket_id,
-                status,
-                subject,
-                created_at,
-                closed_at
-            FROM tickets
-            WHERE user_id = $1
-            ORDER BY id DESC
-            LIMIT 10
-            """,
-            update.effective_user.id,
-        )
+    user = query.from_user
 
-    if not tickets:
-        await update.message.reply_text(
-            "You don't have any support tickets yet."
+    if not is_admin(user.id):
+        await query.answer(
+            "Not authorized.",
+            show_alert=True,
         )
 
         return
 
-    lines = [
-        "🎫 *Your Recent Tickets*\n"
-    ]
+    ticket_id = query.data.split(
+        ":",
+        1,
+    )[1]
 
-    for ticket in tickets:
-        lines.append(
-            f"• `{ticket['ticket_id']}` — "
-            f"{ticket['status']}"
-        )
+    context.user_data[
+        "reply_ticket_id"
+    ] = ticket_id
 
-    lines.append(
-        "\nUse `/ticket TK-000001` "
-        "to view a ticket."
-    )
-
-    await update.message.reply_text(
-        "\n".join(lines),
+    await query.message.reply_text(
+        f"💬 Replying to `{ticket_id}`\n\n"
+        "Send your reply now.",
         parse_mode="Markdown",
     )
 
 
-# ============================================================
-# ADMIN REPLY
-# ============================================================
+# =========================================================
+# ADMIN REPLY MESSAGE
+# =========================================================
 
-async def admin_reply(
+async def admin_reply_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.effective_user:
+    user = update.effective_user
+
+    if not user or not is_admin(user.id):
         return
 
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ Admin access required."
-        )
-
-        return
-
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Use:\n"
-            "/reply TK-000001 Your message"
-        )
-
-        return
-
-    ticket_id = (
-        context.args[0]
-        .upper()
+    ticket_id = context.user_data.get(
+        "reply_ticket_id"
     )
 
-    message = " ".join(
-        context.args[1:]
-    ).strip()
-
-    if not TICKET_PATTERN.match(
-        ticket_id
-    ):
-        await update.message.reply_text(
-            "Invalid ticket ID."
-        )
-
+    if not ticket_id:
         return
+
+    message = update.message
 
     if not message:
-        await update.message.reply_text(
-            "Please provide a reply message."
+        return
+
+    reply_text = message.text
+
+    if not reply_text:
+        await message.reply_text(
+            "❌ Please send a text reply."
         )
 
         return
 
-    await send_admin_reply(
-        update,
-        ticket_id,
-        message,
-    )
-
-
-# ============================================================
-# SEND ADMIN REPLY
-# ============================================================
-
-async def send_admin_reply(
-    update: Update,
-    ticket_id: str,
-    message: str,
-):
     pool = await get_pool()
 
     async with pool.acquire() as connection:
         ticket = await connection.fetchrow(
             """
             SELECT
-                ticket_id,
                 user_id,
                 status
             FROM tickets
@@ -612,24 +414,52 @@ async def send_admin_reply(
             ticket_id,
         )
 
-        if not ticket:
-            await update.message.reply_text(
-                "❌ Ticket not found."
-            )
+    if not ticket:
+        await message.reply_text(
+            "❌ Ticket not found."
+        )
 
-            return
+        context.user_data.pop(
+            "reply_ticket_id",
+            None,
+        )
 
-        if ticket["status"] == "CLOSED":
-            await update.message.reply_text(
-                "🔒 This ticket is already closed."
-            )
+        return
 
-            return
+    customer_id = ticket["user_id"]
 
-        # ----------------------------------------------------
-        # Store response and close ticket
-        # ----------------------------------------------------
+    if not customer_id:
+        await message.reply_text(
+            "❌ Customer ID is missing."
+        )
 
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=customer_id,
+            text=(
+                "💬 *Support Response*\n\n"
+                f"Ticket: `{ticket_id}`\n\n"
+                f"{reply_text}\n\n"
+                "Your ticket has been marked as "
+                "closed. If you have another "
+                "question, please open a new "
+                "support request."
+            ),
+            parse_mode="Markdown",
+        )
+
+    except Exception as exc:
+        await message.reply_text(
+            "❌ Could not send the reply "
+            "to the customer.\n\n"
+            f"Error: {exc}"
+        )
+
+        return
+
+    async with pool.acquire() as connection:
         await connection.execute(
             """
             UPDATE tickets
@@ -640,97 +470,55 @@ async def send_admin_reply(
                 closed_at = NOW()
             WHERE ticket_id = $2
             """,
-            message,
+            reply_text,
             ticket_id,
         )
 
-    # --------------------------------------------------------
-    # Send response to user
-    # --------------------------------------------------------
+    await message.reply_text(
+        f"✅ Reply sent.\n\n"
+        f"🎫 `{ticket_id}` is now closed.",
+        parse_mode="Markdown",
+    )
 
-    try:
-        await update.get_bot().send_message(
-            chat_id=ticket["user_id"],
-            text=(
-                "💬 *Support Response*\n\n"
-                f"Ticket: `{ticket_id}`\n\n"
-                f"{message}\n\n"
-                "🔒 This ticket has been closed.\n\n"
-                "If you have a new issue, use /support "
-                "to create a new ticket."
-            ),
-            parse_mode="Markdown",
-        )
-
-        await update.message.reply_text(
-            f"✅ Reply sent.\n"
-            f"🎫 {ticket_id}\n"
-            "🔒 Ticket closed."
-        )
-
-    except Exception as exc:
-        print(
-            "Failed to send admin reply:",
-            exc,
-        )
-
-        await update.message.reply_text(
-            "⚠️ The reply was saved, but Telegram "
-            "could not deliver it to the user."
-        )
+    context.user_data.pop(
+        "reply_ticket_id",
+        None,
+    )
 
 
-# ============================================================
-# ADMIN CLOSE TICKET
-# ============================================================
+# =========================================================
+# ADMIN CLOSE
+# =========================================================
 
-async def close_ticket(
+async def admin_ticket_close(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.effective_user:
-        return
+    query = update.callback_query
 
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ Admin access required."
+    await query.answer()
+
+    user = query.from_user
+
+    if not is_admin(user.id):
+        await query.answer(
+            "Not authorized.",
+            show_alert=True,
         )
 
         return
 
-    if not context.args:
-        await update.message.reply_text(
-            "Use:\n"
-            "/closeticket TK-000001"
-        )
-
-        return
-
-    ticket_id = (
-        context.args[0]
-        .upper()
-    )
-
-    if not TICKET_PATTERN.match(
-        ticket_id
-    ):
-        await update.message.reply_text(
-            "Invalid ticket ID."
-        )
-
-        return
+    ticket_id = query.data.split(
+        ":",
+        1,
+    )[1]
 
     pool = await get_pool()
 
     async with pool.acquire() as connection:
         ticket = await connection.fetchrow(
             """
-            SELECT
-                ticket_id,
-                user_id,
-                status
+            SELECT user_id
             FROM tickets
             WHERE ticket_id = $1
             """,
@@ -738,15 +526,8 @@ async def close_ticket(
         )
 
         if not ticket:
-            await update.message.reply_text(
+            await query.edit_message_text(
                 "❌ Ticket not found."
-            )
-
-            return
-
-        if ticket["status"] == "CLOSED":
-            await update.message.reply_text(
-                "This ticket is already closed."
             )
 
             return
@@ -763,85 +544,81 @@ async def close_ticket(
             ticket_id,
         )
 
-    try:
-        await update.get_bot().send_message(
-            chat_id=ticket["user_id"],
-            text=(
-                "🔒 *Support Ticket Closed*\n\n"
-                f"Ticket: `{ticket_id}`\n\n"
-                "Your support ticket has been closed.\n"
-                "If you have another issue, use /support "
-                "to create a new ticket."
-            ),
-            parse_mode="Markdown",
-        )
+    customer_id = ticket["user_id"]
 
-    except Exception as exc:
-        print(
-            "Ticket closure notification error:",
-            exc,
-        )
+    if customer_id:
+        try:
+            await context.bot.send_message(
+                chat_id=customer_id,
+                text=(
+                    "🔒 *Support ticket closed*\n\n"
+                    f"Ticket: `{ticket_id}`\n\n"
+                    "If you still need help, "
+                    "please open a new support request."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            print(
+                "Could not notify customer: "
+                f"{exc}"
+            )
 
-    await update.message.reply_text(
-        f"🔒 Ticket `{ticket_id}` closed.",
+    await query.edit_message_text(
+        f"🔒 *Ticket closed*\n\n"
+        f"ID: `{ticket_id}`",
         parse_mode="Markdown",
     )
 
 
-# ============================================================
+# =========================================================
 # ADMIN TICKET LIST
-# ============================================================
+# =========================================================
 
 async def admin_tickets(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.effective_user:
-        return
+    user = update.effective_user
 
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ Admin access required."
-        )
-
+    if not user or not is_admin(user.id):
         return
 
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-        tickets = await connection.fetch(
+        rows = await connection.fetch(
             """
             SELECT
                 ticket_id,
                 user_id,
                 status,
-                subject,
                 created_at
             FROM tickets
-            WHERE status != 'CLOSED'
-            ORDER BY id ASC
-            LIMIT 50
+            ORDER BY created_at DESC
+            LIMIT 20
             """
         )
 
-    if not tickets:
+    if not rows:
         await update.message.reply_text(
-            "✅ No open support tickets."
+            "🎫 No tickets found."
         )
 
         return
 
     lines = [
-        "🎫 *Open Support Tickets*\n"
+        "🎫 *Recent Tickets*",
+        "",
     ]
 
-    for ticket in tickets:
+    for row in rows:
+        status = row["status"]
+
         lines.append(
-            f"• `{ticket['ticket_id']}` — "
-            f"{ticket['status']}\n"
-            f"  User: `{ticket['user_id']}`"
+            f"`{row['ticket_id']}` — "
+            f"{status} — "
+            f"{row['user_id']}"
         )
 
     await update.message.reply_text(
@@ -850,170 +627,56 @@ async def admin_tickets(
     )
 
 
-# ============================================================
-# CALLBACK BUTTONS
-# ============================================================
+# =========================================================
+# ADMIN TICKET STATS
+# =========================================================
 
-async def support_callback(
+async def ticket_stats(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    query = update.callback_query
+    user = update.effective_user
 
-    if not query:
+    if not user or not is_admin(user.id):
         return
 
-    await query.answer()
-
-    user = query.from_user
-
-    if not is_admin(
-        user.id
-    ):
-        await query.answer(
-            "Admin access required.",
-            show_alert=True,
-        )
-
-        return
-
-    data = query.data or ""
-
-    if data.startswith(
-        "support_close:"
-    ):
-        ticket_id = data.split(
-            ":",
-            1,
-        )[1]
-
-        await close_ticket_by_callback(
-            query,
-            ticket_id,
-        )
-
-        return
-
-    if data.startswith(
-        "support_reply:"
-    ):
-        ticket_id = data.split(
-            ":",
-            1,
-        )[1]
-
-        await query.message.reply_text(
-            "💬 Reply to this ticket with:\n\n"
-            f"/reply {ticket_id} Your message"
-        )
-
-        return
-
-
-# ============================================================
-# CALLBACK CLOSE
-# ============================================================
-
-async def close_ticket_by_callback(
-    query,
-    ticket_id: str,
-):
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-        ticket = await connection.fetchrow(
+        rows = await connection.fetch(
             """
             SELECT
-                ticket_id,
-                user_id,
-                status
+                status,
+                COUNT(*) AS total
             FROM tickets
-            WHERE ticket_id = $1
-            """,
-            ticket_id,
-        )
-
-        if not ticket:
-            await query.answer(
-                "Ticket not found.",
-                show_alert=True,
-            )
-
-            return
-
-        if ticket["status"] == "CLOSED":
-            await query.answer(
-                "Already closed.",
-                show_alert=True,
-            )
-
-            return
-
-        await connection.execute(
+            GROUP BY status
             """
-            UPDATE tickets
-            SET
-                status = 'CLOSED',
-                updated_at = NOW(),
-                closed_at = NOW()
-            WHERE ticket_id = $1
-            """,
-            ticket_id,
         )
 
-    try:
-        await query.get_bot().send_message(
-            chat_id=ticket["user_id"],
-            text=(
-                "🔒 *Support Ticket Closed*\n\n"
-                f"Ticket: `{ticket_id}`\n\n"
-                "Your support request has been closed.\n"
-                "Use /support if you need help with "
-                "a new issue."
-            ),
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        print(
-            "Ticket closure notification error:",
-            exc,
-        )
+    counts = {
+        "OPEN": 0,
+        "IN_PROGRESS": 0,
+        "CLOSED": 0,
+        "SOLVED": 0,
+    }
 
-    try:
-        await query.edit_message_reply_markup(
-            reply_markup=None
-        )
-    except Exception:
-        pass
+    for row in rows:
+        counts[row["status"]] = row["total"]
 
-    try:
-        await query.message.reply_text(
-            f"🔒 `{ticket_id}` closed.",
-            parse_mode="Markdown",
-        )
-    except Exception:
-        pass
+    await update.message.reply_text(
+        "🎫 *Ticket Statistics*\n\n"
+        f"🟡 Open: {counts['OPEN']}\n"
+        f"🔵 In Progress: "
+        f"{counts['IN_PROGRESS']}\n"
+        f"🟢 Solved: {counts['SOLVED']}\n"
+        f"⚪ Closed: {counts['CLOSED']}",
+        parse_mode="Markdown",
+    )
 
 
-# ============================================================
-# CANCEL
-# ============================================================
-
-async def support_cancel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if update.message:
-        await update.message.reply_text(
-            "❌ Support request cancelled."
-        )
-
-    return ConversationHandler.END
-
-
-# ============================================================
-# BUILD SUPPORT CONVERSATION
-# ============================================================
+# =========================================================
+# SUPPORT CONVERSATION
+# =========================================================
 
 def build_support_conversation():
     return ConversationHandler(
@@ -1024,72 +687,34 @@ def build_support_conversation():
             ),
         ],
         states={
-            SUPPORT_MESSAGE: [
+            SUPPORT_DESCRIPTION: [
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
-                    support_message,
+                    create_ticket,
                 ),
             ],
         },
         fallbacks=[
             CommandHandler(
                 "cancel",
-                support_cancel,
+                cancel_support,
             ),
         ],
         allow_reentry=True,
     )
 
 
-# ============================================================
-# REGULAR HANDLERS
-# ============================================================
+# =========================================================
+# CANCEL SUPPORT
+# =========================================================
 
-def support_handlers():
-    return [
-        CommandHandler(
-            "ticket",
-            ticket_status,
-        ),
-        CommandHandler(
-            "mytickets",
-            my_tickets,
-        ),
-        CommandHandler(
-            "reply",
-            admin_reply,
-        ),
-        CommandHandler(
-            "closeticket",
-            close_ticket,
-        ),
-        CommandHandler(
-            "tickets",
-            admin_tickets,
-        ),
-        CallbackQueryHandler(
-            support_callback,
-            pattern=r"^support_(reply|close):",
-        ),
-    ]
+async def cancel_support(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "❌ Support request cancelled."
+    )
 
-
-# ============================================================
-# EXPORTS
-# ============================================================
-
-__all__ = [
-    "SUPPORT_MESSAGE",
-    "support_start",
-    "support_message",
-    "ticket_status",
-    "my_tickets",
-    "admin_reply",
-    "close_ticket",
-    "admin_tickets",
-    "support_callback",
-    "support_cancel",
-    "build_support_conversation",
-    "support_handlers",
-]
+    return ConversationHandler.END
