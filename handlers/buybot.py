@@ -1,5 +1,4 @@
 import re
-from typing import Optional
 
 import httpx
 
@@ -45,17 +44,18 @@ SUPPORTED_CHAINS = {
 }
 
 
-# Conversation states
 (
+    BUYBOT_SETTINGS,
     SELECT_TOKEN_CHAIN,
     ENTER_TOKEN_ADDRESS,
+    SELECT_REMOVE_TOKEN,
     ENTER_BUTTON,
     ENTER_TITLE,
     ENTER_TEMPLATE,
     ENTER_EMOJI,
     ENTER_MIN_BUY,
     ENTER_MEDIA,
-) = range(8)
+) = range(10)
 
 
 # =========================================================
@@ -122,6 +122,11 @@ async def require_group_admin(
         )
 
     return False
+
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
 
 
 def settings_keyboard():
@@ -222,13 +227,18 @@ def emoji_keyboard():
     )
 
 
+# =========================================================
+# DATABASE SETTINGS
+# =========================================================
+
+
 async def get_settings(
     group_id: int,
 ):
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-        row = await connection.fetchrow(
+        return await connection.fetchrow(
             """
             SELECT
                 group_id,
@@ -249,8 +259,6 @@ async def get_settings(
             """,
             group_id,
         )
-
-    return row
 
 
 async def ensure_settings(
@@ -288,9 +296,12 @@ async def show_buybot_settings(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     if not await require_group_admin(update):
-        return
+        return BUYBOT_SETTINGS
 
     chat = update.effective_chat
+
+    if not chat:
+        return ConversationHandler.END
 
     await ensure_settings(
         chat.id
@@ -329,18 +340,23 @@ async def show_buybot_settings(
         else update.message
     )
 
+    if not target:
+        return BUYBOT_SETTINGS
+
     await target.reply_text(
         text,
         parse_mode="Markdown",
         reply_markup=settings_keyboard(),
     )
 
+    return BUYBOT_SETTINGS
+
 
 async def buybot_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await show_buybot_settings(
+    return await show_buybot_settings(
         update,
         context,
     )
@@ -355,11 +371,6 @@ async def activate_buybot(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    Main-admin command:
-    /activebuybot <group_id>
-    """
-
     from config import ADMIN_IDS
 
     user = update.effective_user
@@ -421,11 +432,6 @@ async def remove_buybot(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    Main-admin command:
-    /removebuybot <group_id>
-    """
-
     from config import ADMIN_IDS
 
     user = update.effective_user
@@ -475,7 +481,7 @@ async def remove_buybot(
 
 
 # =========================================================
-# TOKEN MANAGEMENT
+# TOKEN VALIDATION
 # =========================================================
 
 
@@ -505,7 +511,9 @@ async def discover_token(
     chain: str,
     contract_address: str,
 ):
-    config = SUPPORTED_CHAINS.get(chain)
+    config = SUPPORTED_CHAINS.get(
+        chain
+    )
 
     if not config:
         return None
@@ -563,6 +571,11 @@ async def discover_token(
         ),
         "dex_url": best.get("url"),
     }
+
+
+# =========================================================
+# ADD TOKEN
+# =========================================================
 
 
 async def add_command(
@@ -836,6 +849,11 @@ async def add_token_address_received(
     return ConversationHandler.END
 
 
+# =========================================================
+# REMOVE TOKEN
+# =========================================================
+
+
 async def remove_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -909,7 +927,7 @@ async def remove_command(
         ),
     )
 
-    return ConversationHandler.END
+    return SELECT_REMOVE_TOKEN
 
 
 async def remove_token_selected(
@@ -925,27 +943,34 @@ async def remove_token_selected(
             "Admin access required.",
             show_alert=True,
         )
-        return
+        return ConversationHandler.END
 
     if query.data == "bb_remove_cancel":
         await query.edit_message_text(
             "❌ Removal cancelled."
         )
-        return
 
-    token_id = int(
-        query.data.replace(
-            "bb_remove_token_",
-            "",
+        return ConversationHandler.END
+
+    try:
+        token_id = int(
+            query.data.replace(
+                "bb_remove_token_",
+                "",
+            )
         )
-    )
+    except ValueError:
+        await query.edit_message_text(
+            "❌ Invalid token selection."
+        )
+        return ConversationHandler.END
 
     chat = update.effective_chat
 
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-        result = await connection.execute(
+        await connection.execute(
             """
             UPDATE buybot_tokens
             SET
@@ -961,6 +986,8 @@ async def remove_token_selected(
     await query.edit_message_text(
         "✅ Token removed from BuyBot monitoring."
     )
+
+    return ConversationHandler.END
 
 
 async def list_tokens(
@@ -1072,10 +1099,6 @@ async def media_menu(
         parse_mode="Markdown",
     )
 
-    context.user_data[
-        "buybot_waiting_for"
-    ] = "media"
-
     return ENTER_MEDIA
 
 
@@ -1107,9 +1130,14 @@ async def media_received(
         await message.reply_text(
             "❌ Please send a photo, GIF, or video."
         )
+
         return ENTER_MEDIA
 
     chat = update.effective_chat
+
+    await ensure_settings(
+        chat.id
+    )
 
     pool = await get_pool()
 
@@ -1128,19 +1156,16 @@ async def media_received(
             chat.id,
         )
 
-    context.user_data.pop(
-        "buybot_waiting_for",
-        None,
-    )
-
     await message.reply_text(
         "✅ BuyBot media updated.\n\n"
         f"Type: `{media_type}`",
         parse_mode="Markdown",
-        reply_markup=settings_keyboard(),
     )
 
-    return ConversationHandler.END
+    return await show_buybot_settings(
+        update,
+        context,
+    )
 
 
 async def reset_media_command(
@@ -1193,10 +1218,6 @@ async def title_menu(
         parse_mode="Markdown",
     )
 
-    context.user_data[
-        "buybot_waiting_for"
-    ] = "title"
-
     return ENTER_TITLE
 
 
@@ -1215,6 +1236,10 @@ async def title_received(
         )
         return ENTER_TITLE
 
+    await ensure_settings(
+        update.effective_chat.id
+    )
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -1230,12 +1255,10 @@ async def title_received(
             update.effective_chat.id,
         )
 
-    await update.message.reply_text(
-        "✅ BuyBot title updated.",
-        reply_markup=settings_keyboard(),
+    return await show_buybot_settings(
+        update,
+        context,
     )
-
-    return ConversationHandler.END
 
 
 # =========================================================
@@ -1265,6 +1288,7 @@ async def template_menu(
         "`{received_symbol}`\n"
         "`{market_cap}`\n"
         "`{buyer}`\n"
+        "`{holder_status}`\n"
         "`{buy_emoji}`\n"
         "`{holder_emoji}`\n"
         "`{market_cap_emoji}`\n"
@@ -1279,10 +1303,6 @@ async def template_menu(
         "`{network_emoji} {chain}`",
         parse_mode="Markdown",
     )
-
-    context.user_data[
-        "buybot_waiting_for"
-    ] = "template"
 
     return ENTER_TEMPLATE
 
@@ -1302,6 +1322,10 @@ async def template_received(
         )
         return ENTER_TEMPLATE
 
+    await ensure_settings(
+        update.effective_chat.id
+    )
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -1317,12 +1341,10 @@ async def template_received(
             update.effective_chat.id,
         )
 
-    await update.message.reply_text(
-        "✅ BuyBot template updated.",
-        reply_markup=settings_keyboard(),
+    return await show_buybot_settings(
+        update,
+        context,
     )
-
-    return ConversationHandler.END
 
 
 # =========================================================
@@ -1345,6 +1367,8 @@ async def emojis_menu(
         parse_mode="Markdown",
         reply_markup=emoji_keyboard(),
     )
+
+    return BUYBOT_SETTINGS
 
 
 async def emoji_type_selected(
@@ -1387,7 +1411,7 @@ async def emoji_type_selected(
     )
 
     if not selected:
-        return
+        return BUYBOT_SETTINGS
 
     field, label = selected
 
@@ -1395,15 +1419,13 @@ async def emoji_type_selected(
         "buybot_emoji_field"
     ] = field
 
-    context.user_data[
-        "buybot_waiting_for"
-    ] = "emoji"
-
     await query.edit_message_text(
         f"😀 *{label} Emoji*\n\n"
         "Send the emoji/custom emoji you want to use.",
         parse_mode="Markdown",
     )
+
+    return ENTER_EMOJI
 
 
 async def emoji_received(
@@ -1418,7 +1440,7 @@ async def emoji_received(
     )
 
     if not field:
-        return ConversationHandler.END
+        return BUYBOT_SETTINGS
 
     value = update.message.text.strip()
 
@@ -1438,7 +1460,11 @@ async def emoji_received(
     }
 
     if field not in allowed_fields:
-        return ConversationHandler.END
+        return BUYBOT_SETTINGS
+
+    await ensure_settings(
+        update.effective_chat.id
+    )
 
     pool = await get_pool()
 
@@ -1460,12 +1486,10 @@ async def emoji_received(
         None,
     )
 
-    await update.message.reply_text(
-        "✅ Emoji updated.",
-        reply_markup=settings_keyboard(),
+    return await show_buybot_settings(
+        update,
+        context,
     )
-
-    return ConversationHandler.END
 
 
 # =========================================================
@@ -1492,10 +1516,6 @@ async def min_buy_menu(
         parse_mode="Markdown",
     )
 
-    context.user_data[
-        "buybot_waiting_for"
-    ] = "min_buy"
-
     return ENTER_MIN_BUY
 
 
@@ -1520,6 +1540,10 @@ async def min_buy_received(
         )
         return ENTER_MIN_BUY
 
+    await ensure_settings(
+        update.effective_chat.id
+    )
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -1535,13 +1559,10 @@ async def min_buy_received(
             update.effective_chat.id,
         )
 
-    await update.message.reply_text(
-        f"✅ Minimum buy changed to `${value:,.2f}`.",
-        parse_mode="Markdown",
-        reply_markup=settings_keyboard(),
+    return await show_buybot_settings(
+        update,
+        context,
     )
-
-    return ConversationHandler.END
 
 
 # =========================================================
@@ -1635,6 +1656,8 @@ async def buttons_menu(
         ),
     )
 
+    return BUYBOT_SETTINGS
+
 
 async def button_add_start(
     update: Update,
@@ -1663,7 +1686,7 @@ async def button_add_start(
             "Maximum 3 custom buttons.",
             show_alert=True,
         )
-        return ConversationHandler.END
+        return BUYBOT_SETTINGS
 
     await query.edit_message_text(
         "➕ *Add Custom Button*\n\n"
@@ -1746,7 +1769,7 @@ async def button_received(
             await update.message.reply_text(
                 "❌ Maximum 3 custom buttons allowed."
             )
-            return ConversationHandler.END
+            return BUYBOT_SETTINGS
 
         position = int(count)
 
@@ -1771,14 +1794,10 @@ async def button_received(
             position,
         )
 
-    await update.message.reply_text(
-        f"✅ Button added:\n\n"
-        f"🔘 {name}\n"
-        f"🔗 {url}",
-        reply_markup=settings_keyboard(),
+    return await show_buybot_settings(
+        update,
+        context,
     )
-
-    return ConversationHandler.END
 
 
 async def clear_buttons(
@@ -1790,11 +1809,7 @@ async def clear_buttons(
     await query.answer()
 
     if not await is_group_admin(update):
-        await query.answer(
-            "Admin access required.",
-            show_alert=True,
-        )
-        return
+        return BUYBOT_SETTINGS
 
     chat_id = update.effective_chat.id
 
@@ -1813,6 +1828,8 @@ async def clear_buttons(
         "✅ All custom BuyBot buttons removed.",
         reply_markup=settings_keyboard(),
     )
+
+    return BUYBOT_SETTINGS
 
 
 # =========================================================
@@ -1852,6 +1869,7 @@ def render_preview(
         "received_symbol": "EXM",
         "market_cap": "84,500",
         "buyer": "0x1234...5678",
+        "holder_status": "New Holder",
         "buy_emoji": (
             settings["buy_emoji"]
             or "🟢"
@@ -1907,7 +1925,7 @@ async def preview_buybot(
     await query.answer()
 
     if not await is_group_admin(update):
-        return
+        return BUYBOT_SETTINGS
 
     settings = await get_settings(
         update.effective_chat.id
@@ -1917,7 +1935,7 @@ async def preview_buybot(
         await query.edit_message_text(
             "❌ BuyBot settings are not initialized."
         )
-        return
+        return BUYBOT_SETTINGS
 
     preview = render_preview(
         settings
@@ -1929,6 +1947,8 @@ async def preview_buybot(
         parse_mode="Markdown",
         reply_markup=settings_keyboard(),
     )
+
+    return BUYBOT_SETTINGS
 
 
 # =========================================================
@@ -1945,7 +1965,7 @@ async def reset_settings(
     await query.answer()
 
     if not await is_group_admin(update):
-        return
+        return BUYBOT_SETTINGS
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -1971,6 +1991,8 @@ async def reset_settings(
         reply_markup=keyboard,
     )
 
+    return BUYBOT_SETTINGS
+
 
 async def reset_confirm(
     update: Update,
@@ -1981,7 +2003,7 @@ async def reset_confirm(
     await query.answer()
 
     if not await is_group_admin(update):
-        return
+        return BUYBOT_SETTINGS
 
     chat_id = update.effective_chat.id
 
@@ -2023,6 +2045,8 @@ async def reset_confirm(
         reply_markup=settings_keyboard(),
     )
 
+    return BUYBOT_SETTINGS
+
 
 # =========================================================
 # SETTINGS CALLBACK ROUTER
@@ -2035,49 +2059,57 @@ async def settings_callback(
 ):
     query = update.callback_query
 
-    await query.answer()
-
     if not await is_group_admin(update):
-        return
+        await query.answer(
+            "Admin access required.",
+            show_alert=True,
+        )
+        return BUYBOT_SETTINGS
 
     data = query.data
 
     if data == "bb_settings":
-        await show_buybot_settings(
+        await query.answer()
+
+        return await show_buybot_settings(
             update,
             context,
         )
 
-    elif data == "bb_close":
+    if data == "bb_close":
+        await query.answer()
+
         await query.edit_message_text(
             "✅ BuyBot settings closed."
         )
 
-    elif data == "bb_media":
+        return ConversationHandler.END
+
+    if data == "bb_media":
         return await media_menu(
             update,
             context,
         )
 
-    elif data == "bb_title":
+    if data == "bb_title":
         return await title_menu(
             update,
             context,
         )
 
-    elif data == "bb_template":
+    if data == "bb_template":
         return await template_menu(
             update,
             context,
         )
 
-    elif data == "bb_emojis":
-        await emojis_menu(
+    if data == "bb_emojis":
+        return await emojis_menu(
             update,
             context,
         )
 
-    elif data.startswith(
+    if data.startswith(
         "bb_emoji_"
     ):
         return await emoji_type_selected(
@@ -2085,47 +2117,49 @@ async def settings_callback(
             context,
         )
 
-    elif data == "bb_minbuy":
+    if data == "bb_minbuy":
         return await min_buy_menu(
             update,
             context,
         )
 
-    elif data == "bb_buttons":
-        await buttons_menu(
+    if data == "bb_buttons":
+        return await buttons_menu(
             update,
             context,
         )
 
-    elif data == "bb_button_add":
+    if data == "bb_button_add":
         return await button_add_start(
             update,
             context,
         )
 
-    elif data == "bb_button_clear":
-        await clear_buttons(
+    if data == "bb_button_clear":
+        return await clear_buttons(
             update,
             context,
         )
 
-    elif data == "bb_preview":
-        await preview_buybot(
+    if data == "bb_preview":
+        return await preview_buybot(
             update,
             context,
         )
 
-    elif data == "bb_reset":
-        await reset_settings(
+    if data == "bb_reset":
+        return await reset_settings(
             update,
             context,
         )
 
-    elif data == "bb_reset_confirm":
-        await reset_confirm(
+    if data == "bb_reset_confirm":
+        return await reset_confirm(
             update,
             context,
         )
+
+    return BUYBOT_SETTINGS
 
 
 # =========================================================
@@ -2153,7 +2187,24 @@ def build_buybot_conversation():
                 remove_command,
             ),
         ],
+
         states={
+
+            # ---------------------------------------------
+            # MAIN SETTINGS MENU
+            # ---------------------------------------------
+
+            BUYBOT_SETTINGS: [
+                CallbackQueryHandler(
+                    settings_callback,
+                    pattern=r"^bb_(settings|close|media|title|template|emojis|minbuy|buttons|button_add|button_clear|preview|reset|reset_confirm|emoji_.*)$",
+                ),
+            ],
+
+            # ---------------------------------------------
+            # ADD TOKEN
+            # ---------------------------------------------
+
             SELECT_TOKEN_CHAIN: [
                 CallbackQueryHandler(
                     add_chain_selected,
@@ -2169,6 +2220,21 @@ def build_buybot_conversation():
                 ),
             ],
 
+            # ---------------------------------------------
+            # REMOVE TOKEN
+            # ---------------------------------------------
+
+            SELECT_REMOVE_TOKEN: [
+                CallbackQueryHandler(
+                    remove_token_selected,
+                    pattern=r"^bb_remove_(token_|cancel)",
+                ),
+            ],
+
+            # ---------------------------------------------
+            # CUSTOM BUTTON
+            # ---------------------------------------------
+
             ENTER_BUTTON: [
                 MessageHandler(
                     filters.TEXT
@@ -2176,6 +2242,10 @@ def build_buybot_conversation():
                     button_received,
                 ),
             ],
+
+            # ---------------------------------------------
+            # TITLE
+            # ---------------------------------------------
 
             ENTER_TITLE: [
                 MessageHandler(
@@ -2185,6 +2255,10 @@ def build_buybot_conversation():
                 ),
             ],
 
+            # ---------------------------------------------
+            # TEMPLATE
+            # ---------------------------------------------
+
             ENTER_TEMPLATE: [
                 MessageHandler(
                     filters.TEXT
@@ -2192,6 +2266,10 @@ def build_buybot_conversation():
                     template_received,
                 ),
             ],
+
+            # ---------------------------------------------
+            # EMOJI
+            # ---------------------------------------------
 
             ENTER_EMOJI: [
                 MessageHandler(
@@ -2201,6 +2279,10 @@ def build_buybot_conversation():
                 ),
             ],
 
+            # ---------------------------------------------
+            # MINIMUM BUY
+            # ---------------------------------------------
+
             ENTER_MIN_BUY: [
                 MessageHandler(
                     filters.TEXT
@@ -2208,6 +2290,10 @@ def build_buybot_conversation():
                     min_buy_received,
                 ),
             ],
+
+            # ---------------------------------------------
+            # MEDIA
+            # ---------------------------------------------
 
             ENTER_MEDIA: [
                 MessageHandler(
@@ -2220,14 +2306,21 @@ def build_buybot_conversation():
                 ),
             ],
         },
+
         fallbacks=[
             CommandHandler(
                 "cancel",
                 cancel_buybot,
             ),
         ],
+
         allow_reentry=True,
     )
+
+
+# =========================================================
+# CANCEL
+# =========================================================
 
 
 async def cancel_buybot(
