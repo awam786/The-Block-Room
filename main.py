@@ -72,11 +72,21 @@ from services.trending_publisher import (
     trending_publisher_worker,
 )
 
+from services.evm_detector import (
+    evm_detector_worker,
+)
+
+from services.solana_detector import (
+    solana_detector_worker,
+)
+
 
 payment_worker_task = None
 trend_activation_worker_task = None
 trending_engine_worker_task = None
 trending_publisher_worker_task = None
+evm_detector_task = None
+solana_detector_task = None
 
 
 async def post_init(
@@ -86,6 +96,8 @@ async def post_init(
     global trend_activation_worker_task
     global trending_engine_worker_task
     global trending_publisher_worker_task
+    global evm_detector_task
+    global solana_detector_task
 
     await init_db()
 
@@ -131,6 +143,57 @@ async def post_init(
         "Trending publisher launched."
     )
 
+    evm_detector_task = (
+        asyncio.create_task(
+            evm_detector_worker()
+        )
+    )
+
+    print(
+        "EVM BuyBot detector launched."
+    )
+
+    solana_detector_task = (
+        asyncio.create_task(
+            solana_detector_worker()
+        )
+    )
+
+    print(
+        "Solana BuyBot detector launched."
+    )
+
+
+async def cancel_task(
+    task,
+    name: str,
+):
+    if not task:
+        return
+
+    if task.done():
+        try:
+            task.result()
+        except (
+            asyncio.CancelledError,
+            Exception,
+        ):
+            pass
+
+        return
+
+    task.cancel()
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        print(
+            f"{name} shutdown error: "
+            f"{exc}"
+        )
+
 
 async def post_shutdown(
     application: Application,
@@ -139,33 +202,45 @@ async def post_shutdown(
     global trend_activation_worker_task
     global trending_engine_worker_task
     global trending_publisher_worker_task
+    global evm_detector_task
+    global solana_detector_task
 
-    tasks = [
+    await cancel_task(
         payment_worker_task,
+        "Payment worker",
+    )
+
+    await cancel_task(
         trend_activation_worker_task,
+        "Trend activation worker",
+    )
+
+    await cancel_task(
         trending_engine_worker_task,
+        "Trending engine",
+    )
+
+    await cancel_task(
         trending_publisher_worker_task,
-    ]
+        "Trending publisher",
+    )
 
-    for task in tasks:
+    await cancel_task(
+        evm_detector_task,
+        "EVM detector",
+    )
 
-        if task:
-            task.cancel()
-
-    for task in tasks:
-
-        if task:
-
-            try:
-                await task
-
-            except asyncio.CancelledError:
-                pass
+    await cancel_task(
+        solana_detector_task,
+        "Solana detector",
+    )
 
     payment_worker_task = None
     trend_activation_worker_task = None
     trending_engine_worker_task = None
     trending_publisher_worker_task = None
+    evm_detector_task = None
+    solana_detector_task = None
 
     await close_db()
 
@@ -178,7 +253,6 @@ async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     await update.message.reply_text(
         "🏛️ *THE BLOCK ROOM*\n\n"
         "📈 /trend — List a token on trending\n"
@@ -194,7 +268,6 @@ async def help_command(
 
 
 def main():
-
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -203,10 +276,6 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-
-    # ========================================================
-    # BASIC
-    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -229,10 +298,6 @@ def main():
         )
     )
 
-    # ========================================================
-    # MAIN ADMIN — BUYBOT ACTIVATION
-    # ========================================================
-
     application.add_handler(
         CommandHandler(
             "activebuybot",
@@ -246,10 +311,6 @@ def main():
             remove_buybot,
         )
     )
-
-    # ========================================================
-    # PRICING
-    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -269,10 +330,6 @@ def main():
             show_prices,
         )
     )
-
-    # ========================================================
-    # PAYMENT WALLETS
-    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -303,10 +360,6 @@ def main():
         )
     )
 
-    # ========================================================
-    # BUYBOT TOKEN LIST
-    # ========================================================
-
     application.add_handler(
         CommandHandler(
             "tokens",
@@ -314,39 +367,19 @@ def main():
         )
     )
 
-    # ========================================================
-    # BUYBOT SETTINGS + TOKEN MANAGEMENT
-    #
-    # Includes:
-    # /buybot
-    # /buybotsettings
-    # /add
-    # /remove
-    #
-    # And all BuyBot inline menus.
-    # ========================================================
-
     application.add_handler(
         build_buybot_conversation()
     )
 
-    # ========================================================
-    # TRENDING CONVERSATION
-    # ========================================================
-
     trend_conversation = ConversationHandler(
-
         entry_points=[
             CommandHandler(
                 "trend",
                 trend_start,
             )
         ],
-
         states={
-
             SELECT_CHAIN: [
-
                 CallbackQueryHandler(
                     chain_selected,
                     pattern=(
@@ -355,18 +388,14 @@ def main():
                     ),
                 ),
             ],
-
             ENTER_CONTRACT: [
-
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
                     contract_received,
                 ),
             ],
-
             SELECT_DURATION: [
-
                 CallbackQueryHandler(
                     duration_selected,
                     pattern=(
@@ -375,19 +404,15 @@ def main():
                     ),
                 ),
             ],
-
             ENTER_TX_HASH: [
-
                 CallbackQueryHandler(
                     payment_started,
                     pattern=r"^trend_paid$",
                 ),
-
                 CallbackQueryHandler(
                     cancel_payment,
                     pattern=r"^trend_cancel_payment$",
                 ),
-
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
@@ -395,24 +420,18 @@ def main():
                 ),
             ],
         },
-
         fallbacks=[
             CommandHandler(
                 "cancel",
                 trend_cancel,
             ),
         ],
-
         allow_reentry=True,
     )
 
     application.add_handler(
         trend_conversation
     )
-
-    # ========================================================
-    # START
-    # ========================================================
 
     print(
         "The Block Room is starting..."
