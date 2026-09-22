@@ -1,10 +1,12 @@
 from urllib.parse import urlparse
+import re
 
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
 )
+
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -20,15 +22,101 @@ from database.connection import get_pool
 
 MAX_CUSTOM_BUTTONS = 3
 
+
 (
     BUYBOT_MENU,
     BUYBOT_BUTTONS,
     BUYBOT_ADD_BUTTON,
-) = range(3)
+    BUYBOT_ADD_CHAIN,
+    BUYBOT_ADD_ADDRESS,
+    BUYBOT_REMOVE_ADDRESS,
+) = range(6)
+
+
+SUPPORTED_CHAINS = {
+    "bnb": {
+        "name": "BNB Smart Chain",
+        "symbol": "BNB",
+    },
+    "ethereum": {
+        "name": "Ethereum",
+        "symbol": "ETH",
+    },
+    "solana": {
+        "name": "Solana",
+        "symbol": "SOL",
+    },
+    "robinhood": {
+        "name": "Robinhood Chain",
+        "symbol": "ETH",
+    },
+}
 
 
 def is_main_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def normalize_chain(value: str):
+    value = value.lower().strip()
+
+    aliases = {
+        "bnb": "bnb",
+        "bsc": "bnb",
+        "binance": "bnb",
+        "binance smart chain": "bnb",
+
+        "eth": "ethereum",
+        "ethereum": "ethereum",
+
+        "sol": "solana",
+        "solana": "solana",
+
+        "robinhood": "robinhood",
+        "robinhood chain": "robinhood",
+        "rh": "robinhood",
+    }
+
+    return aliases.get(value)
+
+
+def valid_evm_address(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"0x[a-fA-F0-9]{40}",
+            value,
+        )
+    )
+
+
+def valid_solana_address(value: str) -> bool:
+    if not re.fullmatch(
+        r"[1-9A-HJ-NP-Za-km-z]+",
+        value,
+    ):
+        return False
+
+    return 32 <= len(value) <= 44
+
+
+def valid_contract_address(
+    chain: str,
+    address: str,
+) -> bool:
+
+    address = address.strip()
+
+    if chain in {
+        "bnb",
+        "ethereum",
+        "robinhood",
+    }:
+        return valid_evm_address(address)
+
+    if chain == "solana":
+        return valid_solana_address(address)
+
+    return False
 
 
 async def is_group_admin(
@@ -81,18 +169,21 @@ async def ensure_group(
                 telegram_id,
                 title,
                 username,
-                is_active
+                is_active,
+                updated_at
             )
             VALUES (
                 $1,
                 $2,
                 $3,
-                TRUE
+                TRUE,
+                NOW()
             )
             ON CONFLICT (telegram_id)
             DO UPDATE SET
                 title = EXCLUDED.title,
-                username = EXCLUDED.username
+                username = EXCLUDED.username,
+                updated_at = NOW()
             """,
             chat.id,
             chat.title,
@@ -182,9 +273,11 @@ async def activate_buybot(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     user = update.effective_user
 
     if not user or not is_main_admin(user.id):
+
         if update.message:
             await update.message.reply_text(
                 "⛔ Only the main bot administrator "
@@ -198,10 +291,12 @@ async def activate_buybot(
     target_group_id = None
 
     if context.args:
+
         try:
             target_group_id = int(
                 context.args[0]
             )
+
         except ValueError:
             target_group_id = None
 
@@ -212,25 +307,30 @@ async def activate_buybot(
         target_group_id = chat.id
 
     if target_group_id is None:
+
         await update.message.reply_text(
             "Usage:\n\n"
-            "/Activebuybot <group_id>\n\n"
-            "Or run /Activebuybot directly "
+            "/activebuybot <group_id>\n\n"
+            "Or run /activebuybot directly "
             "inside the target group."
         )
 
         return
 
     try:
+
         target_chat = await context.bot.get_chat(
             target_group_id
         )
+
     except Exception:
+
         await update.message.reply_text(
             "❌ I could not access that group.\n\n"
-            "Make sure the bot has been added to the "
-            "group first."
+            "Make sure the bot has been added to "
+            "the group first."
         )
+
         return
 
     pool = get_pool()
@@ -244,21 +344,24 @@ async def activate_buybot(
                 title,
                 username,
                 is_active,
-                buybot_enabled
+                buybot_enabled,
+                updated_at
             )
             VALUES (
                 $1,
                 $2,
                 $3,
                 TRUE,
-                TRUE
+                TRUE,
+                NOW()
             )
             ON CONFLICT (telegram_id)
             DO UPDATE SET
                 title = EXCLUDED.title,
                 username = EXCLUDED.username,
                 is_active = TRUE,
-                buybot_enabled = TRUE
+                buybot_enabled = TRUE,
+                updated_at = NOW()
             """,
             target_chat.id,
             target_chat.title,
@@ -287,9 +390,11 @@ async def activate_buybot(
         "✅ *BUYBOT ACTIVATED*\n\n"
         f"Group: {target_chat.title or 'Unknown'}\n"
         f"Group ID: `{target_chat.id}`\n\n"
-        "Group administrators can now open:\n"
-        "👉 /buybot\n\n"
-        "and configure the BuyBot themselves.",
+        "Group administrators can now use:\n\n"
+        "🤖 /buybot\n"
+        "➕ /add\n"
+        "➖ /remove\n"
+        "📋 /tokens",
         parse_mode="Markdown",
     )
 
@@ -298,9 +403,11 @@ async def remove_buybot(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     user = update.effective_user
 
     if not user or not is_main_admin(user.id):
+
         if update.message:
             await update.message.reply_text(
                 "⛔ Only the main bot administrator "
@@ -314,10 +421,12 @@ async def remove_buybot(
     target_group_id = None
 
     if context.args:
+
         try:
             target_group_id = int(
                 context.args[0]
             )
+
         except ValueError:
             target_group_id = None
 
@@ -328,6 +437,7 @@ async def remove_buybot(
         target_group_id = chat.id
 
     if target_group_id is None:
+
         await update.message.reply_text(
             "Usage:\n\n"
             "/removebuybot <group_id>\n\n"
@@ -369,16 +479,22 @@ async def remove_buybot(
     )
 
 
+# ============================================================
+# BUYBOT MAIN MENU
+# ============================================================
+
 async def buybot_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     chat = update.effective_chat
 
     if not chat or chat.type not in {
         "group",
         "supergroup",
     }:
+
         await update.message.reply_text(
             "👥 Use /buybot inside the group "
             "where BuyBot is active."
@@ -390,6 +506,7 @@ async def buybot_start(
         update,
         context,
     ):
+
         await update.message.reply_text(
             "⛔ Only group administrators "
             "can manage BuyBot settings."
@@ -404,6 +521,7 @@ async def buybot_start(
     )
 
     if not enabled:
+
         await update.message.reply_text(
             "🔴 BuyBot is not active in this group.\n\n"
             "Ask the bot owner to activate it."
@@ -423,7 +541,11 @@ async def send_buybot_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     chat = update.effective_chat
+
+    if not chat:
+        return
 
     buttons = await get_buttons(
         chat.id
@@ -436,21 +558,26 @@ async def send_buybot_menu(
     button_count = len(buttons)
 
     if status:
+
         enabled_text = (
             "🟢 Active"
             if status["enabled"]
             else "🔴 Disabled"
         )
+
     else:
         enabled_text = "🟢 Active"
 
     text = (
         "🤖 *THE BLOCK ROOM BUYBOT*\n\n"
         f"Status: {enabled_text}\n\n"
-        "Manage how BuyBot alerts appear in "
-        "this group.\n\n"
+        "Manage how BuyBot alerts appear "
+        "in this group.\n\n"
         "🔗 *Custom inline buttons:* "
         f"{button_count}/{MAX_CUSTOM_BUTTONS}\n\n"
+        "📋 Use /tokens to see monitored tokens.\n"
+        "➕ Use /add to monitor a token.\n"
+        "➖ Use /remove to stop monitoring a token.\n\n"
         "Choose what you want to configure:"
     )
 
@@ -502,10 +629,97 @@ async def send_buybot_menu(
         )
 
 
-async def buybot_buttons_menu(
+# ============================================================
+# TOKEN MANAGEMENT
+# ============================================================
+
+async def add_token_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
+    chat = update.effective_chat
+
+    if not chat or chat.type not in {
+        "group",
+        "supergroup",
+    }:
+
+        await update.message.reply_text(
+            "👥 Use /add inside the BuyBot group."
+        )
+
+        return ConversationHandler.END
+
+    if not await is_group_admin(
+        update,
+        context,
+    ):
+
+        await update.message.reply_text(
+            "⛔ Only group administrators "
+            "can add monitored tokens."
+        )
+
+        return ConversationHandler.END
+
+    if not await is_buybot_enabled(
+        chat.id
+    ):
+
+        await update.message.reply_text(
+            "🔴 BuyBot is not active in this group."
+        )
+
+        return ConversationHandler.END
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🟡 BNB",
+                callback_data="buybot_add_chain_bnb",
+            ),
+            InlineKeyboardButton(
+                "🔵 Ethereum",
+                callback_data="buybot_add_chain_ethereum",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🟣 Solana",
+                callback_data="buybot_add_chain_solana",
+            ),
+            InlineKeyboardButton(
+                "🔴 Robinhood",
+                callback_data="buybot_add_chain_robinhood",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="buybot_token_cancel",
+            ),
+        ],
+    ]
+
+    await update.message.reply_text(
+        "➕ *ADD MONITORED TOKEN*\n\n"
+        "Choose the blockchain where the token "
+        "is deployed:",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+        parse_mode="Markdown",
+    )
+
+    return BUYBOT_ADD_CHAIN
+
+
+async def add_token_chain_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
     query = update.callback_query
 
     await query.answer()
@@ -519,6 +733,554 @@ async def buybot_buttons_menu(
         update,
         context,
     ):
+
+        await query.answer(
+            "Only group administrators can do this.",
+            show_alert=True,
+        )
+
+        return BUYBOT_ADD_CHAIN
+
+    chain = query.data.replace(
+        "buybot_add_chain_",
+        "",
+    )
+
+    if chain not in SUPPORTED_CHAINS:
+
+        await query.answer(
+            "Unsupported chain.",
+            show_alert=True,
+        )
+
+        return BUYBOT_ADD_CHAIN
+
+    context.user_data[
+        "buybot_add_chain"
+    ] = chain
+
+    chain_name = SUPPORTED_CHAINS[
+        chain
+    ]["name"]
+
+    await query.edit_message_text(
+        "➕ *TOKEN CONTRACT*\n\n"
+        f"Network: *{chain_name}*\n\n"
+        "Send the token contract address "
+        "in your next message.\n\n"
+        "Example:\n"
+        "`0x1234...` for EVM chains\n"
+        "or the Solana mint address.",
+        parse_mode="Markdown",
+    )
+
+    return BUYBOT_ADD_ADDRESS
+
+
+async def add_token_address_received(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat = update.effective_chat
+
+    if not chat:
+        return ConversationHandler.END
+
+    if not await is_group_admin(
+        update,
+        context,
+    ):
+
+        await update.message.reply_text(
+            "⛔ Only group administrators "
+            "can add tokens."
+        )
+
+        return ConversationHandler.END
+
+    chain = context.user_data.get(
+        "buybot_add_chain"
+    )
+
+    if not chain:
+
+        await update.message.reply_text(
+            "❌ Session expired. Please use /add again."
+        )
+
+        return ConversationHandler.END
+
+    address = (
+        update.message.text or ""
+    ).strip()
+
+    if not valid_contract_address(
+        chain,
+        address,
+    ):
+
+        chain_name = SUPPORTED_CHAINS[
+            chain
+        ]["name"]
+
+        await update.message.reply_text(
+            "❌ Invalid contract address.\n\n"
+            f"Selected network: {chain_name}\n\n"
+            "Please send a valid token contract "
+            "address."
+        )
+
+        return BUYBOT_ADD_ADDRESS
+
+    pool = get_pool()
+
+    async with pool.acquire() as conn:
+
+        existing = await conn.fetchrow(
+            """
+            SELECT
+                id,
+                token_name,
+                token_symbol,
+                enabled
+            FROM buybot_tokens
+            WHERE group_id = $1
+              AND chain = $2
+              AND LOWER(contract_address) = LOWER($3)
+            """,
+            chat.id,
+            chain,
+            address,
+        )
+
+        if existing:
+
+            await update.message.reply_text(
+                "⚠️ This token is already being monitored "
+                "in this group."
+            )
+
+            context.user_data.pop(
+                "buybot_add_chain",
+                None,
+            )
+
+            return ConversationHandler.END
+
+        await conn.execute(
+            """
+            INSERT INTO buybot_tokens (
+                group_id,
+                chain,
+                contract_address,
+                enabled
+            )
+            VALUES (
+                $1,
+                $2,
+                $3,
+                TRUE
+            )
+            """,
+            chat.id,
+            chain,
+            address,
+        )
+
+    chain_name = SUPPORTED_CHAINS[
+        chain
+    ]["name"]
+
+    context.user_data.pop(
+        "buybot_add_chain",
+        None,
+    )
+
+    await update.message.reply_text(
+        "✅ *TOKEN ADDED*\n\n"
+        f"⛓️ Network: *{chain_name}*\n"
+        f"📍 Contract:\n`{address}`\n\n"
+        "🟢 BuyBot will monitor this token.\n\n"
+        "Use /tokens to view all monitored tokens.",
+        parse_mode="Markdown",
+    )
+
+    return ConversationHandler.END
+
+
+async def list_tokens(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat = update.effective_chat
+
+    if not chat or chat.type not in {
+        "group",
+        "supergroup",
+    }:
+
+        await update.message.reply_text(
+            "👥 Use /tokens inside the BuyBot group."
+        )
+
+        return
+
+    if not await is_group_admin(
+        update,
+        context,
+    ):
+
+        await update.message.reply_text(
+            "⛔ Only group administrators "
+            "can view BuyBot token settings."
+        )
+
+        return
+
+    pool = get_pool()
+
+    async with pool.acquire() as conn:
+
+        rows = await conn.fetch(
+            """
+            SELECT
+                id,
+                chain,
+                contract_address,
+                token_name,
+                token_symbol,
+                enabled
+            FROM buybot_tokens
+            WHERE group_id = $1
+            ORDER BY created_at ASC
+            """,
+            chat.id,
+        )
+
+    if not rows:
+
+        await update.message.reply_text(
+            "📋 *MONITORED TOKENS*\n\n"
+            "No tokens are being monitored yet.\n\n"
+            "Use /add to add the first token.",
+            parse_mode="Markdown",
+        )
+
+        return
+
+    lines = [
+        "📋 *MONITORED TOKENS*",
+        "",
+    ]
+
+    for index, row in enumerate(
+        rows,
+        start=1,
+    ):
+
+        chain_name = SUPPORTED_CHAINS.get(
+            row["chain"],
+            {},
+        ).get(
+            "name",
+            row["chain"],
+        )
+
+        status = (
+            "🟢"
+            if row["enabled"]
+            else "🔴"
+        )
+
+        name = (
+            row["token_name"]
+            or "Unknown Token"
+        )
+
+        symbol = (
+            row["token_symbol"]
+            or "?"
+        )
+
+        lines.append(
+            f"{index}. {status} *{name}* "
+            f"(`{symbol}`)"
+        )
+
+        lines.append(
+            f"   ⛓️ {chain_name}"
+        )
+
+        lines.append(
+            f"   `{row['contract_address']}`"
+        )
+
+        lines.append("")
+
+    lines.append(
+        "➕ /add — Add token"
+    )
+
+    lines.append(
+        "➖ /remove — Remove token"
+    )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
+async def remove_token_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat = update.effective_chat
+
+    if not chat or chat.type not in {
+        "group",
+        "supergroup",
+    }:
+
+        await update.message.reply_text(
+            "👥 Use /remove inside the BuyBot group."
+        )
+
+        return ConversationHandler.END
+
+    if not await is_group_admin(
+        update,
+        context,
+    ):
+
+        await update.message.reply_text(
+            "⛔ Only group administrators "
+            "can remove monitored tokens."
+        )
+
+        return ConversationHandler.END
+
+    pool = get_pool()
+
+    async with pool.acquire() as conn:
+
+        rows = await conn.fetch(
+            """
+            SELECT
+                id,
+                chain,
+                contract_address,
+                token_name,
+                token_symbol
+            FROM buybot_tokens
+            WHERE group_id = $1
+              AND enabled = TRUE
+            ORDER BY created_at ASC
+            """,
+            chat.id,
+        )
+
+    if not rows:
+
+        await update.message.reply_text(
+            "📋 There are no active monitored tokens."
+        )
+
+        return ConversationHandler.END
+
+    keyboard = []
+
+    for row in rows:
+
+        name = (
+            row["token_symbol"]
+            or row["token_name"]
+            or "Token"
+        )
+
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"❌ {name} · "
+                    f"{row['chain'].upper()}",
+                    callback_data=(
+                        f"buybot_remove_token_{row['id']}"
+                    ),
+                )
+            ]
+        )
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "Cancel",
+                callback_data="buybot_token_cancel",
+            )
+        ]
+    )
+
+    await update.message.reply_text(
+        "➖ *REMOVE MONITORED TOKEN*\n\n"
+        "Choose the token you want to stop "
+        "monitoring:",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+        parse_mode="Markdown",
+    )
+
+    return BUYBOT_REMOVE_ADDRESS
+
+
+async def remove_token_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    chat = update.effective_chat
+
+    if not chat:
+        return ConversationHandler.END
+
+    if not await is_group_admin(
+        update,
+        context,
+    ):
+
+        await query.answer(
+            "Only group administrators can do this.",
+            show_alert=True,
+        )
+
+        return BUYBOT_REMOVE_ADDRESS
+
+    try:
+
+        token_id = int(
+            query.data.replace(
+                "buybot_remove_token_",
+                "",
+            )
+        )
+
+    except ValueError:
+
+        await query.answer(
+            "Invalid token.",
+            show_alert=True,
+        )
+
+        return ConversationHandler.END
+
+    pool = get_pool()
+
+    async with pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            """
+            SELECT
+                token_name,
+                token_symbol,
+                chain,
+                contract_address
+            FROM buybot_tokens
+            WHERE id = $1
+              AND group_id = $2
+            """,
+            token_id,
+            chat.id,
+        )
+
+        if not row:
+
+            await query.edit_message_text(
+                "❌ Token not found."
+            )
+
+            return ConversationHandler.END
+
+        await conn.execute(
+            """
+            UPDATE buybot_tokens
+            SET
+                enabled = FALSE,
+                updated_at = NOW()
+            WHERE id = $1
+              AND group_id = $2
+            """,
+            token_id,
+            chat.id,
+        )
+
+    name = (
+        row["token_symbol"]
+        or row["token_name"]
+        or "Token"
+    )
+
+    await query.edit_message_text(
+        "✅ *TOKEN REMOVED*\n\n"
+        f"Token: *{name}*\n"
+        f"Network: *{row['chain'].upper()}*\n\n"
+        "BuyBot will no longer monitor this token.",
+        parse_mode="Markdown",
+    )
+
+    return ConversationHandler.END
+
+
+async def buybot_token_cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    if query:
+        await query.answer()
+
+        await query.edit_message_text(
+            "✅ Token management cancelled."
+        )
+
+    context.user_data.pop(
+        "buybot_add_chain",
+        None,
+    )
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# INLINE BUTTON SETTINGS
+# ============================================================
+
+async def buybot_buttons_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    chat = update.effective_chat
+
+    if not chat:
+        return ConversationHandler.END
+
+    if not await is_group_admin(
+        update,
+        context,
+    ):
+
         await query.answer(
             "Only group administrators can use this.",
             show_alert=True,
@@ -538,13 +1300,14 @@ async def buybot_buttons_menu(
             buttons,
             start=1,
         ):
+
             button_lines.append(
                 f"{index}. "
                 f"🔗 {button['button_name']}"
             )
 
-        current_buttons = (
-            "\n".join(button_lines)
+        current_buttons = "\n".join(
+            button_lines
         )
 
     else:
@@ -566,6 +1329,7 @@ async def buybot_buttons_menu(
     keyboard = []
 
     if len(buttons) < MAX_CUSTOM_BUTTONS:
+
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -576,6 +1340,7 @@ async def buybot_buttons_menu(
         )
 
     if buttons:
+
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -609,6 +1374,7 @@ async def buybot_add_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     await query.answer()
@@ -622,6 +1388,7 @@ async def buybot_add_button(
         update,
         context,
     ):
+
         await query.answer(
             "Only group administrators can add buttons.",
             show_alert=True,
@@ -662,14 +1429,19 @@ def valid_url(
 ) -> bool:
 
     try:
+
         parsed = urlparse(value)
 
-        return parsed.scheme in {
-            "http",
-            "https",
-        } and bool(parsed.netloc)
+        return (
+            parsed.scheme in {
+                "http",
+                "https",
+            }
+            and bool(parsed.netloc)
+        )
 
     except Exception:
+
         return False
 
 
@@ -677,6 +1449,7 @@ async def buybot_receive_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     chat = update.effective_chat
 
     if not chat:
@@ -686,6 +1459,7 @@ async def buybot_receive_button(
         update,
         context,
     ):
+
         await update.message.reply_text(
             "⛔ Only group administrators "
             "can add BuyBot buttons."
@@ -705,16 +1479,10 @@ async def buybot_receive_button(
             "to replace them."
         )
 
-        await send_buybot_menu(
-            update,
-            context,
-        )
-
-        return BUYBOT_MENU
+        return BUYBOT_BUTTONS
 
     raw = (
-        update.message.text
-        or ""
+        update.message.text or ""
     ).strip()
 
     if "|" not in raw:
@@ -822,6 +1590,7 @@ async def buybot_clear_buttons(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     await query.answer()
@@ -835,6 +1604,7 @@ async def buybot_clear_buttons(
         update,
         context,
     ):
+
         await query.answer(
             "Only group administrators can do this.",
             show_alert=True,
@@ -858,18 +1628,21 @@ async def buybot_clear_buttons(
         "All custom buttons cleared."
     )
 
-    await buybot_buttons_menu(
+    return await buybot_buttons_menu(
         update,
         context,
     )
 
-    return BUYBOT_BUTTONS
 
+# ============================================================
+# PREVIEW / APPEARANCE
+# ============================================================
 
 async def buybot_preview(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     await query.answer()
@@ -914,13 +1687,15 @@ async def buybot_preview(
     )
 
     text = (
-        "🚀 *BUYBOT PREVIEW*\n\n"
+        "🚀 *BUY ALERT PREVIEW*\n\n"
         "💚 *LARREY* `$LARREY`\n\n"
-        "🟢 *BUY:* $25.13\n"
-        "🔀 *Spent:* 0.037 BNB\n"
-        "🪙 *Received:* 14,278,367,881,198 LARREY\n\n"
+        "🟢 *BUY DETECTED*\n\n"
+        "💵 Spent: *$25.13*\n"
+        "🔀 Native: *0.037 BNB*\n"
+        "🪙 Received: *14,278,367,881,198 LARREY*\n\n"
         "👤 *New Holder*\n"
-        "💎 *Market Cap:* $786\n\n"
+        "💎 Market Cap: *$786*\n\n"
+        "⛓️ Network: *BNB Smart Chain*\n\n"
         "This is only a preview.\n"
         "Real values will come from the "
         "on-chain BuyBot engine."
@@ -941,17 +1716,23 @@ async def buybot_appearance(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     await query.answer()
 
     await query.edit_message_text(
         "🎨 *BUYBOT APPEARANCE*\n\n"
-        "Custom GIF/video/image, emojis and "
-        "alert formatting will be configured "
-        "here.\n\n"
-        "This section is being connected to "
-        "the BuyBot renderer next.",
+        "This section will control:\n\n"
+        "🖼 Custom image / GIF / video\n"
+        "🟢 Buy emoji\n"
+        "💵 Spent emoji\n"
+        "🪙 Received emoji\n"
+        "👤 Holder indicator\n"
+        "💎 Market-cap indicator\n"
+        "💰 Minimum buy amount\n\n"
+        "The renderer will use these settings "
+        "for every live BuyBot alert.",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
@@ -972,6 +1753,7 @@ async def buybot_back(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     await query.answer()
@@ -988,6 +1770,7 @@ async def buybot_close(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     await query.answer()
@@ -1005,46 +1788,76 @@ async def buybot_cancel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.message.reply_text(
-        "✅ BuyBot settings closed."
+
+    if update.message:
+
+        await update.message.reply_text(
+            "✅ BuyBot settings closed."
+        )
+
+    context.user_data.pop(
+        "buybot_add_chain",
+        None,
     )
 
     return ConversationHandler.END
 
 
+# ============================================================
+# CONVERSATION HANDLER
+# ============================================================
+
 def build_buybot_conversation():
 
     return ConversationHandler(
+
         entry_points=[
+
             CommandHandler(
                 "buybot",
                 buybot_start,
             ),
+
             CommandHandler(
                 "buybotsettings",
                 buybot_start,
+            ),
+
+            CommandHandler(
+                "add",
+                add_token_start,
+            ),
+
+            CommandHandler(
+                "remove",
+                remove_token_start,
             ),
         ],
 
         states={
 
             BUYBOT_MENU: [
+
                 CallbackQueryHandler(
                     buybot_buttons_menu,
                     pattern=r"^buybot_buttons$",
                 ),
+
                 CallbackQueryHandler(
                     buybot_preview,
                     pattern=r"^buybot_preview$",
                 ),
+
                 CallbackQueryHandler(
                     buybot_appearance,
                     pattern=r"^buybot_appearance$",
                 ),
+
                 CallbackQueryHandler(
                     buybot_back,
                     pattern=r"^buybot_back$",
                 ),
+
                 CallbackQueryHandler(
                     buybot_close,
                     pattern=r"^buybot_close$",
@@ -1052,14 +1865,17 @@ def build_buybot_conversation():
             ],
 
             BUYBOT_BUTTONS: [
+
                 CallbackQueryHandler(
                     buybot_add_button,
                     pattern=r"^buybot_add_button$",
                 ),
+
                 CallbackQueryHandler(
                     buybot_clear_buttons,
                     pattern=r"^buybot_clear_buttons$",
                 ),
+
                 CallbackQueryHandler(
                     buybot_back,
                     pattern=r"^buybot_back$",
@@ -1067,15 +1883,55 @@ def build_buybot_conversation():
             ],
 
             BUYBOT_ADD_BUTTON: [
+
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
                     buybot_receive_button,
                 ),
             ],
+
+            BUYBOT_ADD_CHAIN: [
+
+                CallbackQueryHandler(
+                    add_token_chain_selected,
+                    pattern=(
+                        r"^buybot_add_chain_"
+                        r"(bnb|ethereum|solana|robinhood)$"
+                    ),
+                ),
+
+                CallbackQueryHandler(
+                    buybot_token_cancel,
+                    pattern=r"^buybot_token_cancel$",
+                ),
+            ],
+
+            BUYBOT_ADD_ADDRESS: [
+
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    add_token_address_received,
+                ),
+            ],
+
+            BUYBOT_REMOVE_ADDRESS: [
+
+                CallbackQueryHandler(
+                    remove_token_selected,
+                    pattern=r"^buybot_remove_token_\d+$",
+                ),
+
+                CallbackQueryHandler(
+                    buybot_token_cancel,
+                    pattern=r"^buybot_token_cancel$",
+                ),
+            ],
         },
 
         fallbacks=[
+
             CommandHandler(
                 "cancel",
                 buybot_cancel,
