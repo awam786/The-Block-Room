@@ -65,7 +65,8 @@ async def create_tables():
                 username TEXT,
                 is_active BOOLEAN DEFAULT TRUE,
                 buybot_enabled BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -245,11 +246,45 @@ async def create_tables():
                     position
                 )
             );
+
+            CREATE TABLE IF NOT EXISTS buybot_tokens (
+                id BIGSERIAL PRIMARY KEY,
+
+                group_id BIGINT NOT NULL,
+
+                chain TEXT NOT NULL,
+
+                contract_address TEXT NOT NULL,
+
+                token_name TEXT,
+
+                token_symbol TEXT,
+
+                pair_address TEXT,
+
+                dex_url TEXT,
+
+                enabled BOOLEAN DEFAULT TRUE,
+
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+                UNIQUE (
+                    group_id,
+                    chain,
+                    contract_address
+                )
+            );
             """
         )
 
         await conn.execute(
             """
+            ALTER TABLE groups
+            ADD COLUMN IF NOT EXISTS updated_at
+                TIMESTAMPTZ DEFAULT NOW();
+
             ALTER TABLE trends
             ADD COLUMN IF NOT EXISTS buys_24h
                 BIGINT DEFAULT 0;
