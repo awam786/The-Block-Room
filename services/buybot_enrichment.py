@@ -1,11 +1,16 @@
-import asyncio
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import httpx
 
+from services.buybot_holder import (
+    is_first_observed_holder,
+)
 
-DEX_BASE_URL = "https://api.dexscreener.com"
+
+DEX_BASE_URL = (
+    "https://api.dexscreener.com"
+)
 
 
 CHAIN_MAP = {
@@ -13,6 +18,15 @@ CHAIN_MAP = {
     "ethereum": "ethereum",
     "solana": "solana",
     "robinhood": "robinhood",
+}
+
+
+STABLECOINS = {
+    "USDT",
+    "USDC",
+    "DAI",
+    "BUSD",
+    "FDUSD",
 }
 
 
@@ -24,7 +38,9 @@ def decimal_value(
         return default
 
     try:
-        return Decimal(str(value))
+        return Decimal(
+            str(value)
+        )
     except (
         InvalidOperation,
         ValueError,
@@ -138,32 +154,22 @@ def extract_market_data(
         or {}
     )
 
-    market_cap = decimal_value(
-        pair.get(
-            "marketCap"
-        )
-    )
-
-    fdv = decimal_value(
-        pair.get(
-            "fdv"
-        )
-    )
-
-    # Some pairs do not expose marketCap.
-    # FDV is kept separately so we never
-    # pretend FDV is market cap.
-    if market_cap <= 0:
-        market_cap = Decimal("0")
-
     return {
         "price_usd": decimal_value(
             pair.get(
                 "priceUsd"
             )
         ),
-        "market_cap_usd": market_cap,
-        "fdv_usd": fdv,
+        "market_cap_usd": decimal_value(
+            pair.get(
+                "marketCap"
+            )
+        ),
+        "fdv_usd": decimal_value(
+            pair.get(
+                "fdv"
+            )
+        ),
         "liquidity_usd": decimal_value(
             liquidity.get(
                 "usd"
@@ -201,7 +207,7 @@ async def get_market_data(
     )
 
 
-async def get_quote_usd_price(
+async def get_quote_price_usd(
     chain: str,
     quote_symbol: str,
     quote_token_address: Optional[str] = None,
@@ -211,13 +217,7 @@ async def get_quote_usd_price(
         or ""
     ).upper().strip()
 
-    if symbol in {
-        "USDT",
-        "USDC",
-        "DAI",
-        "BUSD",
-        "FDUSD",
-    }:
+    if symbol in STABLECOINS:
         return Decimal("1")
 
     if not quote_token_address:
@@ -247,16 +247,10 @@ async def calculate_spent_usd(
         or ""
     ).upper().strip()
 
-    if symbol in {
-        "USDT",
-        "USDC",
-        "DAI",
-        "BUSD",
-        "FDUSD",
-    }:
+    if symbol in STABLECOINS:
         return native_amount
 
-    price = await get_quote_usd_price(
+    price = await get_quote_price_usd(
         chain,
         symbol,
         quote_token_address,
@@ -274,15 +268,6 @@ async def calculate_spent_usd(
 async def enrich_buy_event(
     event,
 ):
-    """
-    Adds current market information to
-    an existing BuyEvent.
-
-    This function intentionally does not
-    invent a market cap when DEX Screener
-    does not provide one.
-    """
-
     try:
         market_data = (
             await get_market_data(
@@ -318,7 +303,7 @@ async def enrich_buy_event(
 
     except Exception as exc:
         print(
-            "BuyBot enrichment error "
+            "BuyBot market enrichment error "
             f"chain={event.chain} "
             f"token={event.token_address}: "
             f"{exc}"
@@ -327,46 +312,18 @@ async def enrich_buy_event(
     return event
 
 
-async def check_new_holder(
-    token_address: str,
-    buyer_address: str,
-    chain: str,
-) -> bool:
-    """
-    Basic holder-state hook.
-
-    The definitive holder check will be
-    connected to the chain-specific indexer
-    in the next layer.
-
-    For now this safely returns False
-    rather than falsely claiming someone
-    is a new holder.
-    """
-
-    if not buyer_address:
-        return False
-
-    if not token_address:
-        return False
-
-    if not chain:
-        return False
-
-    return False
-
-
 async def enrich_with_holder_status(
     event,
 ):
     try:
         event.is_new_holder = (
-            await check_new_holder(
+            await is_first_observed_holder(
+                event.chain,
                 event.token_address,
                 event.buyer_address,
-                event.chain,
             )
         )
+
     except Exception as exc:
         print(
             "BuyBot holder detection error "
