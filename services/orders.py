@@ -5,21 +5,9 @@ from database.connection import get_pool
 
 
 PAYMENT_CHAINS = {
-    "bnb": {
-        "network": "BNB Smart Chain",
-        "payment_asset": "USDT",
-        "payment_standard": "BEP-20",
-    },
-    "ethereum": {
-        "network": "Ethereum",
-        "payment_asset": "USDT",
-        "payment_standard": "ERC-20",
-    },
-    "solana": {
-        "network": "Solana",
-        "payment_asset": "USDT",
-        "payment_standard": "SPL",
-    },
+    "bnb": "bnb",
+    "ethereum": "ethereum",
+    "solana": "solana",
 }
 
 
@@ -27,12 +15,15 @@ async def create_order(
     user_id: int,
     chain: str,
     token_address: str,
-    token_name: str,
-    token_symbol: str,
+    token_name: Optional[str],
+    token_symbol: Optional[str],
     duration_hours: int,
     amount: Decimal,
 ):
-    chain = chain.lower().strip()
+    chain = (
+        chain
+        or ""
+    ).lower().strip()
 
     if chain not in PAYMENT_CHAINS:
         raise ValueError(
@@ -42,26 +33,63 @@ async def create_order(
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-        wallet = await connection.fetchval(
-            """
-            SELECT wallet_address
-            FROM payment_wallets
-            WHERE LOWER(chain) = LOWER($1)
-              AND enabled = TRUE
-            LIMIT 1;
-            """,
-            chain,
-        )
+        async with connection.transaction():
 
-        if not wallet:
-            raise ValueError(
-                "Payment wallet is not configured "
-                f"for {chain}."
+            # -----------------------------------------------------
+            # LOCK THE CURRENT PAYMENT WALLET INTO THIS ORDER
+            # -----------------------------------------------------
+
+            payment_wallet = await connection.fetchval(
+                """
+                SELECT wallet_address
+                FROM payment_wallets
+                WHERE LOWER(chain) = LOWER($1)
+                  AND enabled = TRUE
+                LIMIT 1;
+                """,
+                chain,
             )
 
-        order_id = await connection.fetchval(
-            """
-            INSERT INTO orders (
+            if not payment_wallet:
+                raise ValueError(
+                    f"No payment wallet is configured "
+                    f"for {chain}."
+                )
+
+            # -----------------------------------------------------
+            # CREATE DATABASE ORDER
+            # -----------------------------------------------------
+
+            database_id = await connection.fetchval(
+                """
+                INSERT INTO orders (
+                    user_id,
+                    chain,
+                    token_address,
+                    token_name,
+                    token_symbol,
+                    duration_hours,
+                    amount,
+                    payment_wallet,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    $8,
+                    'PAYMENT_PENDING',
+                    NOW(),
+                    NOW()
+                )
+                RETURNING id;
+                """,
                 user_id,
                 chain,
                 token_address,
@@ -70,59 +98,79 @@ async def create_order(
                 duration_hours,
                 amount,
                 payment_wallet,
-                status,
-                created_at
             )
-            VALUES (
-                $1,
-                $2,
-                $3,
-                $4,
-                $5,
-                $6,
-                $7,
-                $8,
-                'PAYMENT_PENDING',
-                NOW()
-            )
-            RETURNING order_id;
-            """,
-            user_id,
-            chain,
-            token_address,
-            token_name,
-            token_symbol,
-            duration_hours,
-            amount,
-            wallet,
-        )
 
-        return {
-            "order_id": order_id,
-            "chain": chain,
-            "network": PAYMENT_CHAINS[
-                chain
-            ]["network"],
-            "payment_asset": PAYMENT_CHAINS[
-                chain
-            ]["payment_asset"],
-            "payment_standard": PAYMENT_CHAINS[
-                chain
-            ]["payment_standard"],
-            "amount": amount,
-            "payment_wallet": wallet,
-        }
+            if not database_id:
+                raise RuntimeError(
+                    "Failed to create order."
+                )
+
+            # -----------------------------------------------------
+            # GENERATE PUBLIC ORDER ID
+            # Example: TR-000001
+            # -----------------------------------------------------
+
+            order_id = (
+                f"TR-{int(database_id):06d}"
+            )
+
+            await connection.execute(
+                """
+                UPDATE orders
+                SET
+                    order_id = $1,
+                    updated_at = NOW()
+                WHERE id = $2;
+                """,
+                order_id,
+                database_id,
+            )
+
+            return {
+                "id": database_id,
+                "order_id": order_id,
+                "user_id": user_id,
+                "chain": chain,
+                "token_address": token_address,
+                "token_name": token_name,
+                "token_symbol": token_symbol,
+                "duration_hours": duration_hours,
+                "amount": amount,
+                "payment_wallet": payment_wallet,
+                "status": "PAYMENT_PENDING",
+            }
 
 
 async def get_order(
-    order_id: int,
+    order_id: str,
 ):
+    if not order_id:
+        return None
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
         return await connection.fetchrow(
             """
-            SELECT *
+            SELECT
+                id,
+                order_id,
+                user_id,
+                chain,
+                token_address,
+                token_name,
+                token_symbol,
+                duration_hours,
+                amount,
+                payment_wallet,
+                transaction_hash,
+                status,
+                payment_error,
+                created_at,
+                updated_at,
+                paid_at,
+                activated_at,
+                expires_at
             FROM orders
             WHERE order_id = $1
             LIMIT 1;
@@ -132,15 +180,36 @@ async def get_order(
 
 
 async def get_order_for_user(
-    order_id: int,
+    order_id: str,
     user_id: int,
 ):
+    if not order_id:
+        return None
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
         return await connection.fetchrow(
             """
-            SELECT *
+            SELECT
+                id,
+                order_id,
+                user_id,
+                chain,
+                token_address,
+                token_name,
+                token_symbol,
+                duration_hours,
+                amount,
+                payment_wallet,
+                transaction_hash,
+                status,
+                payment_error,
+                created_at,
+                updated_at,
+                paid_at,
+                activated_at,
+                expires_at
             FROM orders
             WHERE order_id = $1
               AND user_id = $2
@@ -152,16 +221,16 @@ async def get_order_for_user(
 
 
 async def submit_transaction_hash(
-    order_id: int,
-    user_id: int,
+    order_id: str,
     tx_hash: str,
 ):
-    tx_hash = tx_hash.strip()
+    if not order_id:
+        return False
 
     if not tx_hash:
-        raise ValueError(
-            "Transaction hash cannot be empty."
-        )
+        return False
+
+    tx_hash = tx_hash.strip()
 
     pool = await get_pool()
 
@@ -172,9 +241,9 @@ async def submit_transaction_hash(
             SET
                 transaction_hash = $1,
                 status = 'PAYMENT_SUBMITTED',
+                payment_error = NULL,
                 updated_at = NOW()
             WHERE order_id = $2
-              AND user_id = $3
               AND status IN (
                   'PAYMENT_PENDING',
                   'PAYMENT_SUBMITTED'
@@ -182,18 +251,17 @@ async def submit_transaction_hash(
             """,
             tx_hash,
             order_id,
-            user_id,
         )
 
-        if result == "UPDATE 0":
-            return False
-
-        return True
+        return result == "UPDATE 1"
 
 
 async def mark_order_paid(
-    order_id: int,
+    order_id: str,
 ):
+    if not order_id:
+        return False
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -202,10 +270,17 @@ async def mark_order_paid(
             UPDATE orders
             SET
                 status = 'PAID',
-                paid_at = NOW(),
+                paid_at = COALESCE(
+                    paid_at,
+                    NOW()
+                ),
+                payment_error = NULL,
                 updated_at = NOW()
             WHERE order_id = $1
-              AND status = 'PAYMENT_SUBMITTED';
+              AND status IN (
+                  'PAYMENT_PENDING',
+                  'PAYMENT_SUBMITTED'
+              );
             """,
             order_id,
         )
@@ -214,9 +289,12 @@ async def mark_order_paid(
 
 
 async def mark_order_failed(
-    order_id: int,
-    reason: Optional[str] = None,
+    order_id: str,
+    reason: str,
 ):
+    if not order_id:
+        return False
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -228,7 +306,10 @@ async def mark_order_failed(
                 payment_error = $1,
                 updated_at = NOW()
             WHERE order_id = $2
-              AND status = 'PAYMENT_SUBMITTED';
+              AND status IN (
+                  'PAYMENT_PENDING',
+                  'PAYMENT_SUBMITTED'
+              );
             """,
             reason,
             order_id,
@@ -238,8 +319,11 @@ async def mark_order_failed(
 
 
 async def mark_order_waiting_for_launch(
-    order_id: int,
+    order_id: str,
 ):
+    if not order_id:
+        return False
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -259,8 +343,12 @@ async def mark_order_waiting_for_launch(
 
 
 async def mark_order_active(
-    order_id: int,
+    order_id: str,
+    expires_at=None,
 ):
+    if not order_id:
+        return False
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -269,6 +357,14 @@ async def mark_order_active(
             UPDATE orders
             SET
                 status = 'ACTIVE',
+                activated_at = COALESCE(
+                    activated_at,
+                    NOW()
+                ),
+                expires_at = COALESCE(
+                    $2,
+                    expires_at
+                ),
                 updated_at = NOW()
             WHERE order_id = $1
               AND status IN (
@@ -277,14 +373,18 @@ async def mark_order_active(
               );
             """,
             order_id,
+            expires_at,
         )
 
         return result == "UPDATE 1"
 
 
 async def mark_order_expired(
-    order_id: int,
+    order_id: str,
 ):
+    if not order_id:
+        return False
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -306,7 +406,10 @@ async def mark_order_expired(
 async def get_payment_wallet(
     chain: str,
 ):
-    chain = chain.lower().strip()
+    chain = (
+        chain
+        or ""
+    ).lower().strip()
 
     pool = await get_pool()
 
@@ -320,30 +423,4 @@ async def get_payment_wallet(
             LIMIT 1;
             """,
             chain,
-        )
-
-
-async def get_order_payment_wallet(
-    order_id: int,
-):
-    """
-    Returns the wallet that was stored on the
-    order when the order was created.
-
-    This is intentionally different from
-    get_payment_wallet(), which returns the
-    currently configured wallet.
-    """
-
-    pool = await get_pool()
-
-    async with pool.acquire() as connection:
-        return await connection.fetchval(
-            """
-            SELECT payment_wallet
-            FROM orders
-            WHERE order_id = $1
-            LIMIT 1;
-            """,
-            order_id,
         )
