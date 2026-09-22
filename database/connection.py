@@ -391,6 +391,48 @@ async def init_db():
         )
 
         # =========================================================
+        # SYSTEM SETTINGS
+        # =========================================================
+
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_settings (
+                setting_key TEXT PRIMARY KEY,
+
+                setting_value TEXT NOT NULL,
+
+                description TEXT,
+
+                updated_at TIMESTAMPTZ
+                    DEFAULT NOW()
+            );
+            """
+        )
+
+        # =========================================================
+        # DEFAULT PAYMENT SETTINGS
+        # =========================================================
+
+        await connection.execute(
+            """
+            INSERT INTO system_settings (
+                setting_key,
+                setting_value,
+                description
+            )
+            VALUES (
+                'payment_tolerance_usdt',
+                '0.10',
+                'Maximum accepted USDT payment difference.'
+            )
+            ON CONFLICT (
+                setting_key
+            )
+            DO NOTHING;
+            """
+        )
+
+        # =========================================================
         # BUYBOT SETTINGS
         # =========================================================
 
