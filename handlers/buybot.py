@@ -1,6 +1,8 @@
 from urllib.parse import urlparse
 import re
 
+import httpx
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -17,6 +19,7 @@ from telegram.ext import (
 )
 
 from config import ADMIN_IDS
+
 from database.connection import get_pool
 
 
@@ -37,28 +40,45 @@ SUPPORTED_CHAINS = {
     "bnb": {
         "name": "BNB Smart Chain",
         "symbol": "BNB",
+        "dex_chain": "bsc",
     },
     "ethereum": {
         "name": "Ethereum",
         "symbol": "ETH",
+        "dex_chain": "ethereum",
     },
     "solana": {
         "name": "Solana",
         "symbol": "SOL",
+        "dex_chain": "solana",
     },
     "robinhood": {
         "name": "Robinhood Chain",
         "symbol": "ETH",
+        "dex_chain": "robinhood",
     },
 }
 
 
-def is_main_admin(user_id: int) -> bool:
+DEX_BASE_URL = (
+    "https://api.dexscreener.com"
+)
+
+
+def is_main_admin(
+    user_id: int,
+) -> bool:
     return user_id in ADMIN_IDS
 
 
-def normalize_chain(value: str):
-    value = value.lower().strip()
+def normalize_chain(
+    value: str,
+):
+    value = (
+        value
+        .lower()
+        .strip()
+    )
 
     aliases = {
         "bnb": "bnb",
@@ -77,10 +97,14 @@ def normalize_chain(value: str):
         "rh": "robinhood",
     }
 
-    return aliases.get(value)
+    return aliases.get(
+        value
+    )
 
 
-def valid_evm_address(value: str) -> bool:
+def valid_evm_address(
+    value: str,
+) -> bool:
     return bool(
         re.fullmatch(
             r"0x[a-fA-F0-9]{40}",
@@ -89,7 +113,9 @@ def valid_evm_address(value: str) -> bool:
     )
 
 
-def valid_solana_address(value: str) -> bool:
+def valid_solana_address(
+    value: str,
+) -> bool:
     if not re.fullmatch(
         r"[1-9A-HJ-NP-Za-km-z]+",
         value,
@@ -111,10 +137,14 @@ def valid_contract_address(
         "ethereum",
         "robinhood",
     }:
-        return valid_evm_address(address)
+        return valid_evm_address(
+            address
+        )
 
     if chain == "solana":
-        return valid_solana_address(address)
+        return valid_solana_address(
+            address
+        )
 
     return False
 
@@ -137,9 +167,11 @@ async def is_group_admin(
         return False
 
     try:
-        member = await context.bot.get_chat_member(
-            chat.id,
-            user.id,
+        member = (
+            await context.bot.get_chat_member(
+                chat.id,
+                user.id,
+            )
         )
 
     except Exception:
@@ -159,7 +191,7 @@ async def ensure_group(
     if not chat:
         return
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -169,6 +201,7 @@ async def ensure_group(
                 telegram_id,
                 title,
                 username,
+                type,
                 is_active,
                 updated_at
             )
@@ -176,25 +209,31 @@ async def ensure_group(
                 $1,
                 $2,
                 $3,
+                $4,
                 TRUE,
                 NOW()
             )
-            ON CONFLICT (telegram_id)
+            ON CONFLICT (
+                telegram_id
+            )
             DO UPDATE SET
                 title = EXCLUDED.title,
                 username = EXCLUDED.username,
+                type = EXCLUDED.type,
+                is_active = TRUE,
                 updated_at = NOW()
             """,
             chat.id,
             chat.title,
             chat.username,
+            chat.type,
         )
 
 
 async def get_buybot_status(
     group_id: int,
 ):
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -203,16 +242,16 @@ async def get_buybot_status(
             SELECT
                 enabled,
                 min_buy_usd,
-                show_new_holder,
-                show_market_cap,
-                show_spent_amount,
-                show_received_amount,
-                custom_media_type,
+                media_type,
+                media_id,
+                alert_title,
+                alert_template,
                 buy_emoji,
+                new_holder_emoji,
+                market_cap_emoji,
                 spent_emoji,
                 received_emoji,
-                holder_emoji,
-                market_cap_emoji
+                network_emoji
             FROM buybot_settings
             WHERE group_id = $1
             """,
@@ -228,7 +267,7 @@ async def get_buybot_status(
 async def get_buttons(
     group_id: int,
 ):
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -241,7 +280,7 @@ async def get_buttons(
                 button_url
             FROM buybot_buttons
             WHERE group_id = $1
-            ORDER BY position ASC
+            ORDER BY position ASC, id ASC
             """,
             group_id,
         )
@@ -253,21 +292,170 @@ async def is_buybot_enabled(
     group_id: int,
 ) -> bool:
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
         result = await conn.fetchval(
             """
-            SELECT buybot_enabled
-            FROM groups
-            WHERE telegram_id = $1
+            SELECT enabled
+            FROM buybot_settings
+            WHERE group_id = $1
             """,
             group_id,
         )
 
     return bool(result)
 
+
+# ============================================================
+# DEX SCREENER TOKEN DISCOVERY
+# ============================================================
+
+async def discover_token(
+    chain: str,
+    contract_address: str,
+):
+    """
+    Discover token metadata and the best available
+    DEX pair.
+
+    If the token is pre-launch or not indexed yet,
+    this returns an empty result instead of failing.
+
+    This allows the token to remain stored for later
+    discovery by the monitoring layer.
+    """
+
+    chain_config = (
+        SUPPORTED_CHAINS.get(chain)
+    )
+
+    if not chain_config:
+        return None
+
+    url = (
+        f"{DEX_BASE_URL}/latest/dex/tokens/"
+        f"{contract_address}"
+    )
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=15
+        ) as client:
+
+            response = await client.get(
+                url
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+    except (
+        httpx.HTTPError,
+        ValueError,
+    ):
+
+        return None
+
+    pairs = data.get(
+        "pairs"
+    ) or []
+
+    dex_chain = chain_config[
+        "dex_chain"
+    ]
+
+    matching_pairs = []
+
+    for pair in pairs:
+
+        pair_chain = str(
+            pair.get(
+                "chainId",
+                "",
+            )
+        ).lower()
+
+        if pair_chain != dex_chain:
+            continue
+
+        matching_pairs.append(
+            pair
+        )
+
+    if not matching_pairs:
+        return None
+
+    def liquidity_value(
+        pair,
+    ):
+        liquidity = (
+            pair.get(
+                "liquidity"
+            )
+            or {}
+        )
+
+        try:
+            return float(
+                liquidity.get(
+                    "usd"
+                )
+                or 0
+            )
+        except (
+            ValueError,
+            TypeError,
+        ):
+            return 0.0
+
+    best_pair = max(
+        matching_pairs,
+        key=liquidity_value,
+    )
+
+    base_token = (
+        best_pair.get(
+            "baseToken"
+        )
+        or {}
+    )
+
+    return {
+        "token_name": (
+            base_token.get(
+                "name"
+            )
+        ),
+        "token_symbol": (
+            base_token.get(
+                "symbol"
+            )
+        ),
+        "token_address": (
+            base_token.get(
+                "address"
+            )
+        ),
+        "pair_address": (
+            best_pair.get(
+                "pairAddress"
+            )
+        ),
+        "dex_url": (
+            best_pair.get(
+                "url"
+            )
+        ),
+    }
+
+
+# ============================================================
+# MAIN ADMIN BUYBOT ACTIVATION
+# ============================================================
 
 async def activate_buybot(
     update: Update,
@@ -276,7 +464,9 @@ async def activate_buybot(
 
     user = update.effective_user
 
-    if not user or not is_main_admin(user.id):
+    if not user or not is_main_admin(
+        user.id
+    ):
 
         if update.message:
             await update.message.reply_text(
@@ -319,8 +509,10 @@ async def activate_buybot(
 
     try:
 
-        target_chat = await context.bot.get_chat(
-            target_group_id
+        target_chat = (
+            await context.bot.get_chat(
+                target_group_id
+            )
         )
 
     except Exception:
@@ -333,7 +525,7 @@ async def activate_buybot(
 
         return
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -343,29 +535,32 @@ async def activate_buybot(
                 telegram_id,
                 title,
                 username,
+                type,
                 is_active,
-                buybot_enabled,
                 updated_at
             )
             VALUES (
                 $1,
                 $2,
                 $3,
-                TRUE,
+                $4,
                 TRUE,
                 NOW()
             )
-            ON CONFLICT (telegram_id)
+            ON CONFLICT (
+                telegram_id
+            )
             DO UPDATE SET
                 title = EXCLUDED.title,
                 username = EXCLUDED.username,
+                type = EXCLUDED.type,
                 is_active = TRUE,
-                buybot_enabled = TRUE,
                 updated_at = NOW()
             """,
             target_chat.id,
             target_chat.title,
             target_chat.username,
+            target_chat.type,
         )
 
         await conn.execute(
@@ -378,7 +573,9 @@ async def activate_buybot(
                 $1,
                 TRUE
             )
-            ON CONFLICT (group_id)
+            ON CONFLICT (
+                group_id
+            )
             DO UPDATE SET
                 enabled = TRUE,
                 updated_at = NOW()
@@ -406,7 +603,9 @@ async def remove_buybot(
 
     user = update.effective_user
 
-    if not user or not is_main_admin(user.id):
+    if not user or not is_main_admin(
+        user.id
+    ):
 
         if update.message:
             await update.message.reply_text(
@@ -446,20 +645,9 @@ async def remove_buybot(
 
         return
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
-
-        await conn.execute(
-            """
-            UPDATE groups
-            SET
-                buybot_enabled = FALSE,
-                updated_at = NOW()
-            WHERE telegram_id = $1
-            """,
-            target_group_id,
-        )
 
         await conn.execute(
             """
@@ -468,6 +656,17 @@ async def remove_buybot(
                 enabled = FALSE,
                 updated_at = NOW()
             WHERE group_id = $1
+            """,
+            target_group_id,
+        )
+
+        await conn.execute(
+            """
+            UPDATE groups
+            SET
+                is_active = TRUE,
+                updated_at = NOW()
+            WHERE telegram_id = $1
             """,
             target_group_id,
         )
@@ -514,7 +713,9 @@ async def buybot_start(
 
         return ConversationHandler.END
 
-    await ensure_group(update)
+    await ensure_group(
+        update
+    )
 
     enabled = await is_buybot_enabled(
         chat.id
@@ -555,7 +756,9 @@ async def send_buybot_menu(
         chat.id
     )
 
-    button_count = len(buttons)
+    button_count = len(
+        buttons
+    )
 
     if status:
 
@@ -566,7 +769,7 @@ async def send_buybot_menu(
         )
 
     else:
-        enabled_text = "🟢 Active"
+        enabled_text = "🔴 Disabled"
 
     text = (
         "🤖 *THE BLOCK ROOM BUYBOT*\n\n"
@@ -620,7 +823,7 @@ async def send_buybot_menu(
             parse_mode="Markdown",
         )
 
-    else:
+    elif update.message:
 
         await update.message.reply_text(
             text,
@@ -677,27 +880,37 @@ async def add_token_start(
         [
             InlineKeyboardButton(
                 "🟡 BNB",
-                callback_data="buybot_add_chain_bnb",
+                callback_data=(
+                    "buybot_add_chain_bnb"
+                ),
             ),
             InlineKeyboardButton(
                 "🔵 Ethereum",
-                callback_data="buybot_add_chain_ethereum",
+                callback_data=(
+                    "buybot_add_chain_ethereum"
+                ),
             ),
         ],
         [
             InlineKeyboardButton(
                 "🟣 Solana",
-                callback_data="buybot_add_chain_solana",
+                callback_data=(
+                    "buybot_add_chain_solana"
+                ),
             ),
             InlineKeyboardButton(
                 "🔴 Robinhood",
-                callback_data="buybot_add_chain_robinhood",
+                callback_data=(
+                    "buybot_add_chain_robinhood"
+                ),
             ),
         ],
         [
             InlineKeyboardButton(
                 "❌ Cancel",
-                callback_data="buybot_token_cancel",
+                callback_data=(
+                    "buybot_token_cancel"
+                ),
             ),
         ],
     ]
@@ -759,9 +972,11 @@ async def add_token_chain_selected(
         "buybot_add_chain"
     ] = chain
 
-    chain_name = SUPPORTED_CHAINS[
-        chain
-    ]["name"]
+    chain_name = (
+        SUPPORTED_CHAINS[
+            chain
+        ]["name"]
+    )
 
     await query.edit_message_text(
         "➕ *TOKEN CONTRACT*\n\n"
@@ -820,9 +1035,11 @@ async def add_token_address_received(
         address,
     ):
 
-        chain_name = SUPPORTED_CHAINS[
-            chain
-        ]["name"]
+        chain_name = (
+            SUPPORTED_CHAINS[
+                chain
+            ]["name"]
+        )
 
         await update.message.reply_text(
             "❌ Invalid contract address.\n\n"
@@ -833,7 +1050,74 @@ async def add_token_address_received(
 
         return BUYBOT_ADD_ADDRESS
 
-    pool = get_pool()
+    await update.message.reply_text(
+        "🔎 Checking the token and looking for "
+        "a live trading pair..."
+    )
+
+    discovery = await discover_token(
+        chain,
+        address,
+    )
+
+    token_name = None
+    token_symbol = None
+    pair_address = None
+    dex_url = None
+
+    if discovery:
+
+        discovered_address = (
+            discovery.get(
+                "token_address"
+            )
+        )
+
+        if (
+            discovered_address
+            and chain != "solana"
+            and discovered_address.lower()
+            != address.lower()
+        ):
+
+            discovery = None
+
+        elif (
+            discovered_address
+            and chain == "solana"
+            and discovered_address
+            != address
+        ):
+
+            discovery = None
+
+    if discovery:
+
+        token_name = (
+            discovery.get(
+                "token_name"
+            )
+        )
+
+        token_symbol = (
+            discovery.get(
+                "token_symbol"
+            )
+        )
+
+        pair_address = (
+            discovery.get(
+                "pair_address"
+            )
+        )
+
+        dex_url = (
+            discovery.get(
+                "dex_url"
+            )
+        )
+
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -843,11 +1127,14 @@ async def add_token_address_received(
                 id,
                 token_name,
                 token_symbol,
+                pair_address,
+                dex_url,
                 enabled
             FROM buybot_tokens
             WHERE group_id = $1
               AND chain = $2
-              AND LOWER(contract_address) = LOWER($3)
+              AND LOWER(contract_address) =
+                  LOWER($3)
             """,
             chat.id,
             chain,
@@ -856,55 +1143,125 @@ async def add_token_address_received(
 
         if existing:
 
-            await update.message.reply_text(
-                "⚠️ This token is already being monitored "
-                "in this group."
-            )
+            if not existing["enabled"]:
 
-            context.user_data.pop(
-                "buybot_add_chain",
-                None,
-            )
+                await conn.execute(
+                    """
+                    UPDATE buybot_tokens
+                    SET
+                        enabled = TRUE,
+                        token_name = COALESCE(
+                            $1,
+                            token_name
+                        ),
+                        token_symbol = COALESCE(
+                            $2,
+                            token_symbol
+                        ),
+                        pair_address = COALESCE(
+                            $3,
+                            pair_address
+                        ),
+                        dex_url = COALESCE(
+                            $4,
+                            dex_url
+                        ),
+                        updated_at = NOW()
+                    WHERE id = $5
+                    """,
+                    token_name,
+                    token_symbol,
+                    pair_address,
+                    dex_url,
+                    existing["id"],
+                )
 
-            return ConversationHandler.END
+            else:
 
-        await conn.execute(
-            """
-            INSERT INTO buybot_tokens (
-                group_id,
+                await update.message.reply_text(
+                    "⚠️ This token is already being "
+                    "monitored in this group."
+                )
+
+                context.user_data.pop(
+                    "buybot_add_chain",
+                    None,
+                )
+
+                return ConversationHandler.END
+
+        else:
+
+            await conn.execute(
+                """
+                INSERT INTO buybot_tokens (
+                    group_id,
+                    chain,
+                    contract_address,
+                    token_name,
+                    token_symbol,
+                    pair_address,
+                    dex_url,
+                    enabled
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    TRUE
+                )
+                """,
+                chat.id,
                 chain,
-                contract_address,
-                enabled
+                address,
+                token_name,
+                token_symbol,
+                pair_address,
+                dex_url,
             )
-            VALUES (
-                $1,
-                $2,
-                $3,
-                TRUE
-            )
-            """,
-            chat.id,
-            chain,
-            address,
-        )
 
-    chain_name = SUPPORTED_CHAINS[
-        chain
-    ]["name"]
+    chain_name = (
+        SUPPORTED_CHAINS[
+            chain
+        ]["name"]
+    )
 
     context.user_data.pop(
         "buybot_add_chain",
         None,
     )
 
-    await update.message.reply_text(
-        "✅ *TOKEN ADDED*\n\n"
-        f"⛓️ Network: *{chain_name}*\n"
-        f"📍 Contract:\n`{address}`\n\n"
-        "🟢 BuyBot will monitor this token.\n\n"
-        "Use /tokens to view all monitored tokens.",
-        parse_mode="Markdown",
-    )
+    if pair_address:
+
+        await update.message.reply_text(
+            "✅ *TOKEN ADDED*\n\n"
+            f"🪙 Token: "
+            f"*{token_name or 'Unknown'}*"
+            f" (`{token_symbol or '?'} `)\n"
+            f"⛓️ Network: *{chain_name}*\n"
+            f"📍 Contract:\n`{address}`\n\n"
+            f"🔗 Pair:\n`{pair_address}`\n\n"
+            "🟢 Live pair detected.\n"
+            "BuyBot is ready to monitor swaps.",
+            parse_mode="Markdown",
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "✅ *TOKEN SAVED*\n\n"
+            f"⛓️ Network: *{chain_name}*\n"
+            f"📍 Contract:\n`{address}`\n\n"
+            "🟡 No live trading pair was found yet.\n\n"
+            "The token remains saved and can be "
+            "picked up when a trading pair becomes "
+            "available.",
+            parse_mode="Markdown",
+        )
 
     return ConversationHandler.END
 
@@ -939,7 +1296,7 @@ async def list_tokens(
 
         return
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -951,6 +1308,7 @@ async def list_tokens(
                 contract_address,
                 token_name,
                 token_symbol,
+                pair_address,
                 enabled
             FROM buybot_tokens
             WHERE group_id = $1
@@ -980,12 +1338,14 @@ async def list_tokens(
         start=1,
     ):
 
-        chain_name = SUPPORTED_CHAINS.get(
-            row["chain"],
-            {},
-        ).get(
-            "name",
-            row["chain"],
+        chain_name = (
+            SUPPORTED_CHAINS.get(
+                row["chain"],
+                {},
+            ).get(
+                "name",
+                row["chain"],
+            )
         )
 
         status = (
@@ -1016,6 +1376,19 @@ async def list_tokens(
         lines.append(
             f"   `{row['contract_address']}`"
         )
+
+        if row["pair_address"]:
+
+            lines.append(
+                f"   🔗 Pair: "
+                f"`{row['pair_address']}`"
+            )
+
+        else:
+
+            lines.append(
+                "   🟡 Pair: Not detected yet"
+            )
 
         lines.append("")
 
@@ -1063,7 +1436,7 @@ async def remove_token_start(
 
         return ConversationHandler.END
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -1107,7 +1480,8 @@ async def remove_token_start(
                     f"❌ {name} · "
                     f"{row['chain'].upper()}",
                     callback_data=(
-                        f"buybot_remove_token_{row['id']}"
+                        f"buybot_remove_token_"
+                        f"{row['id']}"
                     ),
                 )
             ]
@@ -1117,7 +1491,9 @@ async def remove_token_start(
         [
             InlineKeyboardButton(
                 "Cancel",
-                callback_data="buybot_token_cancel",
+                callback_data=(
+                    "buybot_token_cancel"
+                ),
             )
         ]
     )
@@ -1179,7 +1555,7 @@ async def remove_token_selected(
 
         return ConversationHandler.END
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -1281,9 +1657,9 @@ async def buybot_buttons_menu(
         context,
     ):
 
-        await query.answer(
-            "Only group administrators can use this.",
-            show_alert=True,
+        await query.edit_message_text(
+            "⛔ Only group administrators "
+            "can use this."
         )
 
         return BUYBOT_MENU
@@ -1334,7 +1710,9 @@ async def buybot_buttons_menu(
             [
                 InlineKeyboardButton(
                     "➕ Add Button",
-                    callback_data="buybot_add_button",
+                    callback_data=(
+                        "buybot_add_button"
+                    ),
                 ),
             ]
         )
@@ -1345,7 +1723,9 @@ async def buybot_buttons_menu(
             [
                 InlineKeyboardButton(
                     "🗑 Clear All",
-                    callback_data="buybot_clear_buttons",
+                    callback_data=(
+                        "buybot_clear_buttons"
+                    ),
                 ),
             ]
         )
@@ -1389,9 +1769,9 @@ async def buybot_add_button(
         context,
     ):
 
-        await query.answer(
-            "Only group administrators can add buttons.",
-            show_alert=True,
+        await query.edit_message_text(
+            "⛔ Only group administrators "
+            "can add buttons."
         )
 
         return BUYBOT_BUTTONS
@@ -1430,14 +1810,18 @@ def valid_url(
 
     try:
 
-        parsed = urlparse(value)
+        parsed = urlparse(
+            value
+        )
 
         return (
             parsed.scheme in {
                 "http",
                 "https",
             }
-            and bool(parsed.netloc)
+            and bool(
+                parsed.netloc
+            )
         )
 
     except Exception:
@@ -1475,7 +1859,7 @@ async def buybot_receive_button(
 
         await update.message.reply_text(
             "⚠️ You already have 3 custom buttons.\n\n"
-            "Use 🗑 Clear All first if you want "
+            "Use Clear All first if you want "
             "to replace them."
         )
 
@@ -1542,9 +1926,11 @@ async def buybot_receive_button(
 
         return BUYBOT_ADD_BUTTON
 
-    position = len(buttons) + 1
+    position = (
+        len(buttons) + 1
+    )
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -1605,14 +1991,14 @@ async def buybot_clear_buttons(
         context,
     ):
 
-        await query.answer(
-            "Only group administrators can do this.",
-            show_alert=True,
+        await query.edit_message_text(
+            "⛔ Only group administrators "
+            "can do this."
         )
 
         return BUYBOT_BUTTONS
 
-    pool = get_pool()
+    pool = await get_pool()
 
     async with pool.acquire() as conn:
 
@@ -1623,10 +2009,6 @@ async def buybot_clear_buttons(
             """,
             chat.id,
         )
-
-    await query.answer(
-        "All custom buttons cleared."
-    )
 
     return await buybot_buttons_menu(
         update,
@@ -1731,8 +2113,9 @@ async def buybot_appearance(
         "👤 Holder indicator\n"
         "💎 Market-cap indicator\n"
         "💰 Minimum buy amount\n\n"
-        "The renderer will use these settings "
-        "for every live BuyBot alert.",
+        "These settings will be connected "
+        "to the live renderer in the next "
+        "BuyBot settings stage.",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
@@ -1840,27 +2223,37 @@ def build_buybot_conversation():
 
                 CallbackQueryHandler(
                     buybot_buttons_menu,
-                    pattern=r"^buybot_buttons$",
+                    pattern=(
+                        r"^buybot_buttons$"
+                    ),
                 ),
 
                 CallbackQueryHandler(
                     buybot_preview,
-                    pattern=r"^buybot_preview$",
+                    pattern=(
+                        r"^buybot_preview$"
+                    ),
                 ),
 
                 CallbackQueryHandler(
                     buybot_appearance,
-                    pattern=r"^buybot_appearance$",
+                    pattern=(
+                        r"^buybot_appearance$"
+                    ),
                 ),
 
                 CallbackQueryHandler(
                     buybot_back,
-                    pattern=r"^buybot_back$",
+                    pattern=(
+                        r"^buybot_back$"
+                    ),
                 ),
 
                 CallbackQueryHandler(
                     buybot_close,
-                    pattern=r"^buybot_close$",
+                    pattern=(
+                        r"^buybot_close$"
+                    ),
                 ),
             ],
 
@@ -1868,17 +2261,23 @@ def build_buybot_conversation():
 
                 CallbackQueryHandler(
                     buybot_add_button,
-                    pattern=r"^buybot_add_button$",
+                    pattern=(
+                        r"^buybot_add_button$"
+                    ),
                 ),
 
                 CallbackQueryHandler(
                     buybot_clear_buttons,
-                    pattern=r"^buybot_clear_buttons$",
+                    pattern=(
+                        r"^buybot_clear_buttons$"
+                    ),
                 ),
 
                 CallbackQueryHandler(
                     buybot_back,
-                    pattern=r"^buybot_back$",
+                    pattern=(
+                        r"^buybot_back$"
+                    ),
                 ),
             ],
 
@@ -1903,7 +2302,9 @@ def build_buybot_conversation():
 
                 CallbackQueryHandler(
                     buybot_token_cancel,
-                    pattern=r"^buybot_token_cancel$",
+                    pattern=(
+                        r"^buybot_token_cancel$"
+                    ),
                 ),
             ],
 
@@ -1920,12 +2321,16 @@ def build_buybot_conversation():
 
                 CallbackQueryHandler(
                     remove_token_selected,
-                    pattern=r"^buybot_remove_token_\d+$",
+                    pattern=(
+                        r"^buybot_remove_token_\d+$"
+                    ),
                 ),
 
                 CallbackQueryHandler(
                     buybot_token_cancel,
-                    pattern=r"^buybot_token_cancel$",
+                    pattern=(
+                        r"^buybot_token_cancel$"
+                    ),
                 ),
             ],
         },
