@@ -3,6 +3,7 @@ import math
 from datetime import datetime, timezone
 
 from database.connection import get_pool
+
 from services.dex import (
     get_token_pairs,
     choose_best_pair,
@@ -28,7 +29,7 @@ async def get_setting(
         value = await conn.fetchval(
             """
             SELECT value
-            FROM settings
+            FROM system_settings
             WHERE key = $1
             """,
             key,
@@ -65,6 +66,9 @@ def logarithmic_score(
     if value <= 0:
         return 0.0
 
+    if maximum <= 0:
+        return 0.0
+
     return min(
         100.0,
         (
@@ -83,10 +87,6 @@ def calculate_market_score(
     price_change_24h: float,
     recent_activity: float,
 ):
-    # --------------------------------------------------------
-    # NORMALIZED MARKET COMPONENTS
-    # --------------------------------------------------------
-
     volume_score = logarithmic_score(
         volume_24h,
         10_000_000,
@@ -107,8 +107,6 @@ def calculate_market_score(
         10_000,
     )
 
-    # Price momentum is capped so extreme percentages
-    # cannot completely dominate the ranking.
     momentum = max(
         -100.0,
         min(
@@ -131,11 +129,7 @@ def calculate_market_score(
         ),
     )
 
-    # --------------------------------------------------------
-    # NATURAL MARKET SCORE
-    # --------------------------------------------------------
-
-    score = (
+    return (
         volume_score * 0.30
         + liquidity_score * 0.20
         + market_cap_score * 0.15
@@ -144,8 +138,6 @@ def calculate_market_score(
         + recent_score * 0.05
     )
 
-    return score
-
 
 def calculate_paid_placement_score(
     market_score: float,
@@ -153,12 +145,12 @@ def calculate_paid_placement_score(
     has_activity: bool,
 ):
     """
-    Paid promotion is deliberately handled separately
-    from the natural market score.
+    Paid promotion is handled separately from the
+    natural market score.
 
-    This gives paid listings guaranteed visibility while
-    preventing payment alone from automatically producing
-    #1 when the token has no real market activity.
+    This provides paid listings with visibility while
+    preventing an inactive low-cap token from reaching #1
+    simply because it paid for promotion.
     """
 
     if not has_activity:
@@ -278,11 +270,9 @@ def has_meaningful_activity(
         buys + sells
     )
 
-    # Any positive transaction activity counts.
     if total_transactions > 0:
         return True
 
-    # A newly observed increase in volume also counts.
     if volume > previous_volume:
         return True
 
@@ -464,12 +454,19 @@ def determine_paid_priority(
     has_activity: bool,
 ):
     """
-    Returns the preferred maximum rank area for paid tokens.
+    Preferred visibility area:
 
-    < $50K       -> #3-#5 area
-    $50K-$100K   -> #3-#4 area
-    > $100K      -> #2-#3 area
-    >= $500K     -> eligible for #1
+    Below $50K:
+        #3-#5 area
+
+    $50K-$100K:
+        #3-#4 area
+
+    Above $100K:
+        #2-#3 area
+
+    $500K+:
+        Eligible for #1
     """
 
     if not has_activity:
@@ -491,16 +488,18 @@ async def assign_ranks(
     evaluated_trends,
 ):
     """
-    Hybrid ranking:
+    Hybrid ranking system.
 
-    1. Natural market score remains the primary ranking signal.
-    2. Paid listings receive protected visibility.
-    3. Paid placement is limited by market-cap/activity rules.
-    4. A low-activity paid token cannot simply buy #1.
+    Natural market performance remains important.
+
+    Paid promotion provides protected visibility
+    according to market-cap and activity rules.
+
+    An inactive paid token cannot buy #1.
     """
 
     if not evaluated_trends:
-        return
+        return []
 
     paid_candidates = []
     normal_candidates = []
@@ -508,6 +507,7 @@ async def assign_ranks(
     for item in evaluated_trends:
 
         if item["paid_promotion"]:
+
             priority = determine_paid_priority(
                 item["market_cap"],
                 item["market_score"],
@@ -525,24 +525,18 @@ async def assign_ranks(
                 item
             )
 
-    # --------------------------------------------------------
-    # Sort natural candidates by real market performance.
-    # --------------------------------------------------------
-
     normal_candidates.sort(
-        key=lambda x: x["market_score"],
+        key=lambda item: (
+            item["market_score"],
+            item["final_score"],
+        ),
         reverse=True,
     )
 
-    # --------------------------------------------------------
-    # Paid candidates are also sorted by their actual
-    # performance, not merely payment time.
-    # --------------------------------------------------------
-
     paid_candidates.sort(
-        key=lambda x: (
-            x["paid_priority"],
-            -x["market_score"],
+        key=lambda item: (
+            item["paid_priority"],
+            -item["market_score"],
         )
     )
 
@@ -551,20 +545,26 @@ async def assign_ranks(
     used_ids = set()
 
     # --------------------------------------------------------
-    # First place eligible $500K+ active paid tokens.
-    # Only the strongest eligible candidate gets #1.
+    # Eligible $500K+ paid tokens.
+    # Strongest eligible paid token can occupy #1.
     # --------------------------------------------------------
 
     top_paid = [
         item
         for item in paid_candidates
-        if item["paid_priority"] == 1
-        and item["has_activity"]
+        if (
+            item["paid_priority"] == 1
+            and item["has_activity"]
+        )
     ]
 
     if top_paid:
+
         top_paid.sort(
-            key=lambda x: x["market_score"],
+            key=lambda item: (
+                item["market_score"],
+                item["final_score"],
+            ),
             reverse=True,
         )
 
@@ -579,7 +579,7 @@ async def assign_ranks(
         )
 
     # --------------------------------------------------------
-    # Place remaining paid candidates in protected area.
+    # Remaining paid listings.
     # --------------------------------------------------------
 
     remaining_paid = [
@@ -589,16 +589,11 @@ async def assign_ranks(
     ]
 
     remaining_paid.sort(
-        key=lambda x: (
-            x["paid_priority"],
-            -x["market_score"],
+        key=lambda item: (
+            item["paid_priority"],
+            -item["market_score"],
         )
     )
-
-    # --------------------------------------------------------
-    # Insert paid candidates while respecting their intended
-    # visibility area.
-    # --------------------------------------------------------
 
     for paid in remaining_paid:
 
@@ -609,23 +604,14 @@ async def assign_ranks(
         if desired_rank <= 1:
             desired_rank = 2
 
-        if desired_rank <= 3:
-            desired_rank = min(
-                desired_rank,
-                3,
-            )
+        elif desired_rank <= 3:
+            desired_rank = 3
 
         elif desired_rank <= 4:
-            desired_rank = min(
-                desired_rank,
-                4,
-            )
+            desired_rank = 4
 
         else:
-            desired_rank = min(
-                desired_rank,
-                5,
-            )
+            desired_rank = 5
 
         insert_index = min(
             max(
@@ -645,7 +631,7 @@ async def assign_ranks(
         )
 
     # --------------------------------------------------------
-    # Fill remaining positions with organic trends.
+    # Fill remaining positions with organic listings.
     # --------------------------------------------------------
 
     for item in normal_candidates:
@@ -658,66 +644,106 @@ async def assign_ranks(
         )
 
     # --------------------------------------------------------
-    # If a paid token is extremely strong, allow its natural
-    # score to compete for #1.
+    # Protect the intended paid visibility area.
     # --------------------------------------------------------
 
-    if len(final_order) > 1:
-
-        final_order.sort(
-            key=lambda x: (
-                x["market_score"]
-                if (
-                    x["market_cap"]
-                    >= TOP_MC_THRESHOLD
-                    and x["has_activity"]
-                )
-                else -x["paid_priority"],
-                x["market_score"],
-            ),
-            reverse=True,
+    protected_paid = [
+        item
+        for item in final_order
+        if (
+            item["paid_promotion"]
+            and item["has_activity"]
+            and item["market_cap"]
+            < TOP_MC_THRESHOLD
         )
+    ]
 
-        # Re-apply protected visibility for low-MC paid
-        # listings after the natural-score competition.
-        protected = [
-            item
-            for item in final_order
-            if (
-                item["paid_promotion"]
-                and item["market_cap"]
-                < TOP_MC_THRESHOLD
-                and item["has_activity"]
-            )
-        ]
+    for item in protected_paid:
 
-        for item in protected:
+        if item["market_cap"] < LOW_MC_THRESHOLD:
+            target_rank = 5
 
-            if item["market_cap"] < LOW_MC_THRESHOLD:
-                target = 5
+        elif item["market_cap"] < HIGH_MC_THRESHOLD:
+            target_rank = 4
 
-            elif item["market_cap"] < HIGH_MC_THRESHOLD:
-                target = 4
+        else:
+            target_rank = 3
 
-            else:
-                target = 3
-
+        try:
             current_index = final_order.index(
                 item
             )
 
-            if current_index + 1 > target:
+        except ValueError:
+            continue
+
+        current_rank = (
+            current_index + 1
+        )
+
+        if current_rank > target_rank:
+
+            final_order.pop(
+                current_index
+            )
+
+            target_index = min(
+                target_rank - 1,
+                len(final_order),
+            )
+
+            final_order.insert(
+                target_index,
+                item,
+            )
+
+    # --------------------------------------------------------
+    # Final rule:
+    #
+    # An active $500K+ paid token may compete naturally
+    # for #1.
+    #
+    # Lower-cap paid tokens stay protected in their
+    # visibility zones.
+    # --------------------------------------------------------
+
+    if len(final_order) > 1:
+
+        top_eligible = [
+            item
+            for item in final_order
+            if (
+                item["market_cap"]
+                >= TOP_MC_THRESHOLD
+                and item["has_activity"]
+            )
+        ]
+
+        if top_eligible:
+
+            top_eligible.sort(
+                key=lambda item: (
+                    item["market_score"],
+                    item["final_score"],
+                ),
+                reverse=True,
+            )
+
+            strongest = top_eligible[0]
+
+            current_index = final_order.index(
+                strongest
+            )
+
+            if current_index != 0:
 
                 final_order.pop(
                     current_index
                 )
 
                 final_order.insert(
-                    min(
-                        target - 1,
-                        len(final_order),
-                    ),
-                    item,
+                    0,
+                    strongest,
                 )
 
     return final_order
@@ -767,8 +793,8 @@ async def run_trending_cycle():
         )
 
         if not market_data:
-            # Do not immediately delete a token merely because
-            # an API request temporarily failed.
+            # Temporary API failure must not immediately
+            # remove an active listing.
             continue
 
         volume = safe_number(
@@ -801,9 +827,14 @@ async def run_trending_cycle():
             )
         )
 
+        # ----------------------------------------------------
+        # Recent activity score.
+        # ----------------------------------------------------
+
         recent_activity = 100.0
 
         if trend["last_activity_at"]:
+
             elapsed = (
                 datetime.now(
                     timezone.utc
@@ -842,10 +873,13 @@ async def run_trending_cycle():
         paid_score = 0.0
 
         if trend["paid_promotion"]:
-            paid_score = calculate_paid_placement_score(
-                market_score,
-                market_cap,
-                has_activity,
+
+            paid_score = (
+                calculate_paid_placement_score(
+                    market_score,
+                    market_cap,
+                    has_activity,
+                )
             )
 
         final_score = calculate_final_score(
@@ -868,6 +902,7 @@ async def run_trending_cycle():
             not has_activity
             and inactivity_started_at
         ):
+
             inactive_seconds = (
                 datetime.now(
                     timezone.utc
@@ -879,6 +914,7 @@ async def run_trending_cycle():
                 inactive_seconds
                 >= inactivity_minutes * 60
             ):
+
                 await remove_inactive_trend(
                     trend["id"]
                 )
@@ -886,7 +922,8 @@ async def run_trending_cycle():
                 print(
                     f"Removed inactive trend "
                     f"{trend['token_symbol']} "
-                    f"after {inactivity_minutes} minutes."
+                    f"after "
+                    f"{inactivity_minutes} minutes."
                 )
 
                 continue
@@ -924,6 +961,7 @@ async def trending_engine_worker():
     while True:
 
         try:
+
             update_seconds = int(
                 await get_setting(
                     "trending_update_seconds",
@@ -936,6 +974,7 @@ async def trending_engine_worker():
             ranked = await run_trending_cycle()
 
             if ranked:
+
                 print(
                     "Trending rankings updated: "
                     + ", ".join(
@@ -950,6 +989,7 @@ async def trending_engine_worker():
             raise
 
         except Exception as exc:
+
             print(
                 f"Trending engine error: {exc}"
             )
