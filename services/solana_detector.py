@@ -10,6 +10,10 @@ from config import (
 
 from database.connection import get_pool
 
+from services.buybot_alert import (
+    send_buy_alert,
+)
+
 
 # ============================================================
 # HELIUS CONFIGURATION
@@ -78,7 +82,7 @@ async def event_exists(
               AND chain = $2
               AND tx_hash = $3
               AND LOWER(token_address)
-                    = LOWER($4)
+                  = LOWER($4)
             LIMIT 1
             """,
             group_id,
@@ -160,17 +164,7 @@ async def get_buybot_settings(
             """
             SELECT
                 enabled,
-                min_buy_usd,
-                media_type,
-                media_id,
-                alert_title,
-                alert_template,
-                buy_emoji,
-                new_holder_emoji,
-                market_cap_emoji,
-                spent_emoji,
-                received_emoji,
-                network_emoji
+                min_buy_usd
             FROM buybot_settings
             WHERE group_id = $1
             """,
@@ -187,6 +181,7 @@ async def get_token_transactions(
 ):
 
     if not HELIUS_API_KEY:
+
         print(
             "HELIUS_API_KEY is not configured."
         )
@@ -345,8 +340,8 @@ def extract_buy(
     )
 
     #
-    # A BUY means the monitored token appears
-    # in tokenOutputs.
+    # A BUY means the monitored token
+    # appears in tokenOutputs.
     #
 
     received = None
@@ -368,32 +363,34 @@ def extract_buy(
         if mint.lower() != token_address:
             continue
 
-        amount = (
+        raw_token_amount = (
             output.get(
                 "rawTokenAmount",
-                {}
+                {},
             )
-            .get(
+            or {}
+        )
+
+        amount = (
+            raw_token_amount.get(
                 "tokenAmount"
             )
         )
 
         decimals = (
-            output.get(
-                "rawTokenAmount",
-                {}
-            )
-            .get(
+            raw_token_amount.get(
                 "decimals"
             )
         )
 
         if amount is None:
+
             amount = output.get(
                 "amount"
             )
 
         if decimals is None:
+
             decimals = 0
 
         try:
@@ -428,10 +425,7 @@ def extract_buy(
         return None
 
     #
-    # Determine the buyer.
-    #
-    # Helius can expose the fee payer and
-    # account data. Prefer feePayer where available.
+    # Buyer.
     #
 
     buyer = (
@@ -444,18 +438,13 @@ def extract_buy(
     )
 
     #
-    # Determine quote value.
-    #
-    # Helius swap events can contain native SOL
-    # or token input information.
+    # Determine native SOL input.
     #
 
     spent_sol = Decimal("0")
 
-    native_input = (
-        token_swap.get(
-            "nativeInput"
-        )
+    native_input = token_swap.get(
+        "nativeInput"
     )
 
     if native_input:
@@ -464,8 +453,7 @@ def extract_buy(
 
             lamports = Decimal(
                 str(
-                    native_input
-                    .get(
+                    native_input.get(
                         "amount",
                         0,
                     )
@@ -480,48 +468,53 @@ def extract_buy(
             )
 
         except Exception:
+
             spent_sol = Decimal("0")
 
     #
-    # Look for stablecoin input.
+    # Determine token input.
     #
 
     spent_token = Decimal("0")
 
     for item in token_inputs:
 
-        amount = (
+        raw_token_amount = (
             item.get(
                 "rawTokenAmount",
-                {}
+                {},
             )
-            .get(
+            or {}
+        )
+
+        amount = (
+            raw_token_amount.get(
                 "tokenAmount"
             )
         )
 
         decimals = (
-            item.get(
-                "rawTokenAmount",
-                {}
-            )
-            .get(
+            raw_token_amount.get(
                 "decimals"
             )
         )
 
         if amount is None:
+
             amount = item.get(
                 "amount"
             )
 
         if decimals is None:
+
             decimals = 0
 
         try:
 
             value = (
-                Decimal(str(amount))
+                Decimal(
+                    str(amount)
+                )
                 / (
                     Decimal(10)
                     ** int(decimals)
@@ -544,11 +537,13 @@ def extract_buy(
         ],
         "spent_sol": spent_sol,
         "spent_token": spent_token,
-        "signature": transaction.get(
-            "signature"
-        )
-        or transaction.get(
-            "transactionSignature"
+        "signature": (
+            transaction.get(
+                "signature"
+            )
+            or transaction.get(
+                "transactionSignature"
+            )
         ),
     }
 
@@ -595,10 +590,6 @@ async def process_token(
         )
     )
 
-    #
-    # Process the newest transactions first.
-    #
-
     for transaction_summary in (
         transactions
     ):
@@ -613,10 +604,8 @@ async def process_token(
             continue
 
         #
-        # First duplicate check.
-        #
-        # This avoids requesting full transaction
-        # data for transactions we've already handled.
+        # Duplicate protection before requesting
+        # the full parsed transaction.
         #
 
         if await event_exists(
@@ -654,13 +643,26 @@ async def process_token(
             continue
 
         #
-        # Solana native SOL value isn't USD yet.
+        # The current detector knows the SOL amount,
+        # but not its USD value.
         #
-        # We deliberately don't pretend SOL = USD.
-        # The market-data layer will convert it later.
+        # We therefore don't pretend the SOL quantity
+        # is a USD amount.
+        #
+        # USD market-price conversion will be added in
+        # the market-data layer.
         #
 
         spent_usd = Decimal("0")
+
+        #
+        # If a group has a USD minimum configured,
+        # don't incorrectly reject the transaction here
+        # because the detector hasn't converted SOL to USD.
+        #
+        # The future market-data layer will enforce the
+        # minimum after conversion.
+        #
 
         if (
             minimum_buy > 0
@@ -668,6 +670,10 @@ async def process_token(
             and spent_usd < minimum_buy
         ):
             continue
+
+        #
+        # Save event.
+        #
 
         await save_event(
             group_id=group_id,
@@ -686,10 +692,52 @@ async def process_token(
             ],
         )
 
+        #
+        # Send through the SAME renderer used
+        # by BNB / Ethereum / Robinhood.
+        #
+
+        try:
+
+            await send_buy_alert(
+                bot=None,
+                group_id=group_id,
+                chain="SOL",
+                token_address=token_address,
+                token_name=token[
+                    "token_name"
+                ],
+                token_symbol=token[
+                    "token_symbol"
+                ],
+                buyer_address=buy[
+                    "buyer"
+                ],
+                spent_amount_usd=spent_usd,
+                received_amount=buy[
+                    "received_amount"
+                ],
+                tx_hash=signature,
+                market_cap_usd=None,
+                dex_url=token[
+                    "dex_url"
+                ],
+                trending_url=None,
+            )
+
+        except Exception as exc:
+
+            print(
+                f"Failed sending Solana "
+                f"BuyBot alert for "
+                f"{signature}: {exc}"
+            )
+
         print(
             "SOLANA BUY DETECTED | "
             f"group={group_id} | "
-            f"token={token['token_symbol']} | "
+            f"token="
+            f"{token['token_symbol']} | "
             f"received="
             f"{buy['received_amount']} | "
             f"buyer={buy['buyer']} | "
