@@ -1,4 +1,3 @@
-import re
 from typing import Any, Dict, Optional
 
 import httpx
@@ -15,105 +14,199 @@ from services.dex import (
 )
 
 
-EVM_ADDRESS_RE = re.compile(
-    r"^0x[a-fA-F0-9]{40}$"
-)
-
-SOLANA_ADDRESS_RE = re.compile(
-    r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"
-)
-
-
-CHAIN_ALIASES = {
-    "bsc": "bnb",
-    "binance": "bnb",
-    "bnb": "bnb",
-    "eth": "ethereum",
-    "ethereum": "ethereum",
-    "sol": "solana",
-    "solana": "solana",
-    "rh": "robinhood",
-    "robinhood": "robinhood",
+SUPPORTED_CHAINS = {
+    "bnb",
+    "ethereum",
+    "solana",
+    "robinhood",
 }
 
 
-RPC_URLS = {
+EVM_CHAINS = {
+    "bnb",
+    "ethereum",
+    "robinhood",
+}
+
+
+EVM_RPC_URLS = {
     "bnb": BNB_RPC_URL,
     "ethereum": ETHEREUM_RPC_URL,
     "robinhood": ROBINHOOD_RPC_URL,
 }
 
 
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
 def normalize_chain(
     chain: str,
 ) -> str:
-    return CHAIN_ALIASES.get(
-        str(chain).strip().lower(),
-        str(chain).strip().lower(),
+    value = (
+        str(chain or "")
+        .strip()
+        .lower()
+    )
+
+    aliases = {
+        "bsc": "bnb",
+        "binance": "bnb",
+        "binance smart chain": "bnb",
+        "bnb smart chain": "bnb",
+        "eth": "ethereum",
+        "mainnet": "ethereum",
+        "sol": "solana",
+        "rh": "robinhood",
+        "robinhood chain": "robinhood",
+    }
+
+    return aliases.get(
+        value,
+        value,
     )
 
 
-def is_evm_address(
+def normalize_evm_address(
+    address: str,
+) -> str:
+    return (
+        str(address or "")
+        .strip()
+        .lower()
+    )
+
+
+# ============================================================
+# ADDRESS VALIDATION
+# ============================================================
+
+def is_valid_evm_address(
     address: str,
 ) -> bool:
-    return bool(
-        EVM_ADDRESS_RE.fullmatch(
-            address.strip()
+    value = str(
+        address or ""
+    ).strip()
+
+    if len(value) != 42:
+        return False
+
+    if not value.startswith(
+        "0x"
+    ):
+        return False
+
+    try:
+        int(
+            value[2:],
+            16,
         )
-    )
+    except ValueError:
+        return False
+
+    return True
 
 
-def is_solana_address(
+def is_valid_solana_address(
     address: str,
 ) -> bool:
-    return bool(
-        SOLANA_ADDRESS_RE.fullmatch(
-            address.strip()
-        )
+    value = str(
+        address or ""
+    ).strip()
+
+    if not (
+        32
+        <= len(value)
+        <= 44
+    ):
+        return False
+
+    alphabet = (
+        "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+        "abcdefghijkmnopqrstuvwxyz"
     )
 
+    return all(
+        character in alphabet
+        for character in value
+    )
+
+
+def is_valid_address(
+    chain: str,
+    address: str,
+) -> bool:
+    chain = normalize_chain(
+        chain
+    )
+
+    if chain in EVM_CHAINS:
+        return is_valid_evm_address(
+            address
+        )
+
+    if chain == "solana":
+        return is_valid_solana_address(
+            address
+        )
+
+    return False
+
+
+# ============================================================
+# EVM RPC
+# ============================================================
 
 async def rpc_call(
     rpc_url: str,
     method: str,
     params: list,
 ) -> Optional[Any]:
+    if not rpc_url:
+        return None
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    }
+
     try:
         async with httpx.AsyncClient(
-            timeout=15
+            timeout=20
         ) as client:
             response = await client.post(
                 rpc_url,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params,
-                },
+                json=payload,
             )
 
             response.raise_for_status()
 
             data = response.json()
 
-            if "error" in data:
-                return None
-
-            return data.get("result")
-
     except Exception as exc:
         print(
-            "RPC call error "
+            f"RPC error "
             f"method={method}: {exc}"
         )
         return None
 
+    if data.get("error"):
+        return None
 
-async def evm_contract_exists(
+    return data.get(
+        "result"
+    )
+
+
+async def contract_exists(
     chain: str,
     address: str,
 ) -> bool:
-    rpc_url = RPC_URLS.get(chain)
+    rpc_url = EVM_RPC_URLS.get(
+        chain
+    )
 
     if not rpc_url:
         return False
@@ -127,37 +220,29 @@ async def evm_contract_exists(
         ],
     )
 
-    if not code:
+    if not isinstance(
+        code,
+        str,
+    ):
         return False
 
+    return code not in {
+        "",
+        "0x",
+        "0x0",
+    }
+
+
+# ============================================================
+# ERC-20 TOKEN METADATA
+# ============================================================
+
+def encode_address_parameter(
+    address: str,
+) -> str:
     return (
-        isinstance(code, str)
-        and code.startswith("0x")
-        and code != "0x"
-        and code != "0x0"
-    )
-
-
-async def evm_call(
-    chain: str,
-    to: str,
-    data: str,
-) -> Optional[str]:
-    rpc_url = RPC_URLS.get(chain)
-
-    if not rpc_url:
-        return None
-
-    return await rpc_call(
-        rpc_url,
-        "eth_call",
-        [
-            {
-                "to": to,
-                "data": data,
-            },
-            "latest",
-        ],
+        "000000000000000000000000"
+        + address[2:].lower()
     )
 
 
@@ -167,89 +252,113 @@ def decode_abi_string(
     if not value:
         return None
 
-    if not isinstance(value, str):
-        return None
-
-    if not value.startswith("0x"):
+    if not value.startswith(
+        "0x"
+    ):
         return None
 
     raw = value[2:]
 
     try:
-        data = bytes.fromhex(raw)
+        # Dynamic ABI string:
+        # offset + length + data
+        if len(raw) >= 128:
+            offset = int(
+                raw[0:64],
+                16,
+            )
 
-        # Standard dynamic ABI string:
-        #
-        # offset
-        # length
-        # bytes
-        if len(data) >= 64:
-            offset = int.from_bytes(
-                data[0:32],
-                "big",
+            offset_hex = (
+                offset * 2
             )
 
             if (
-                offset + 32
-                <= len(data)
+                offset_hex + 64
+                <= len(raw)
             ):
-                length = int.from_bytes(
-                    data[
-                        offset:
-                        offset + 32
+                length = int(
+                    raw[
+                        offset_hex:
+                        offset_hex + 64
                     ],
-                    "big",
+                    16,
                 )
 
                 start = (
-                    offset + 32
+                    offset_hex
+                    + 64
                 )
-                end = start + length
 
-                if end <= len(data):
-                    return (
-                        data[start:end]
-                        .decode(
-                            "utf-8",
-                            errors="ignore",
-                        )
-                        .strip("\x00")
-                    )
+                end = (
+                    start
+                    + length * 2
+                )
+
+                if end <= len(raw):
+                    decoded = bytes.fromhex(
+                        raw[start:end]
+                    ).decode(
+                        "utf-8",
+                        errors="ignore",
+                    ).strip()
+
+                    if decoded:
+                        return decoded
 
         # bytes32 fallback
-        if len(data) >= 32:
-            return (
-                data[:32]
-                .rstrip(b"\x00")
-                .decode(
-                    "utf-8",
-                    errors="ignore",
-                )
-                .strip()
-            )
+        data = bytes.fromhex(
+            raw[:64]
+        )
+
+        decoded = data.rstrip(
+            b"\x00"
+        ).decode(
+            "utf-8",
+            errors="ignore",
+        ).strip()
+
+        return decoded or None
 
     except Exception:
         return None
 
-    return None
 
-
-async def get_evm_token_metadata(
+async def get_erc20_metadata(
     chain: str,
     address: str,
 ) -> Dict[str, Optional[str]]:
-    # ERC-20 name()
-    name_result = await evm_call(
-        chain,
-        address,
-        "0x06fdde03",
+    rpc_url = EVM_RPC_URLS.get(
+        chain
     )
 
-    # ERC-20 symbol()
-    symbol_result = await evm_call(
-        chain,
-        address,
-        "0x95d89b41",
+    if not rpc_url:
+        return {
+            "name": None,
+            "symbol": None,
+        }
+
+    name_result = await rpc_call(
+        rpc_url,
+        "eth_call",
+        [
+            {
+                "to": address,
+                "data": "0x06fdde03",
+            },
+            "latest",
+        ],
+    )
+
+    symbol_result = await rpc_call(
+        rpc_url,
+        "eth_call",
+        [
+            {
+                "to": address,
+                "data": "0x95d89b41",
+            },
+            "latest",
+        ],
     )
 
     return {
@@ -262,26 +371,28 @@ async def get_evm_token_metadata(
     }
 
 
+# ============================================================
+# SOLANA METADATA
+# ============================================================
+
 async def get_solana_asset(
     address: str,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     if not HELIUS_API_KEY:
-        return {}
+        return None
 
     url = (
-        "https://mainnet.helius-rpc.com/"
-        f"?api-key={HELIUS_API_KEY}"
+        "https://api-mainnet.helius-rpc.com/"
+        "?api-key="
+        f"{HELIUS_API_KEY}"
     )
 
     payload = {
         "jsonrpc": "2.0",
-        "id": "block-room",
+        "id": 1,
         "method": "getAsset",
         "params": {
             "id": address,
-            "displayOptions": {
-                "showFungible": True,
-            },
         },
     }
 
@@ -298,176 +409,64 @@ async def get_solana_asset(
 
             data = response.json()
 
-            return data.get(
-                "result",
-                {},
-            )
-
     except Exception as exc:
         print(
             "Helius asset lookup error: "
             f"{exc}"
         )
-        return {}
+        return None
 
+    if data.get("error"):
+        return None
 
-def extract_solana_metadata(
-    asset: Dict[str, Any],
-) -> Dict[str, Optional[str]]:
-    content = asset.get(
-        "content",
-        {},
+    return data.get(
+        "result"
     )
 
-    metadata = content.get(
-        "metadata",
-        {}
-    )
 
-    token_info = asset.get(
-        "token_info",
-        {}
-    )
+# ============================================================
+# DEX MARKET DATA
+# ============================================================
 
-    name = (
-        metadata.get("name")
-        or token_info.get("symbol")
-    )
-
-    symbol = (
-        metadata.get("symbol")
-        or token_info.get("symbol")
-    )
-
-    return {
-        "name": name,
-        "symbol": symbol,
-    }
-
-
-async def validate_token(
+async def get_pair_data(
     chain: str,
-    contract_address: str,
-) -> Dict[str, Any]:
-    chain = normalize_chain(chain)
+    address: str,
+) -> Optional[Dict[str, Any]]:
+    try:
+        pair = await get_best_token_pair(
+            chain,
+            address,
+        )
+    except Exception as exc:
+        print(
+            "DEX pair lookup error "
+            f"chain={chain}: {exc}"
+        )
+        return None
 
-    contract_address = (
-        str(contract_address)
-        .strip()
+    if not pair:
+        return None
+
+    return pair
+
+
+# ============================================================
+# EVM TOKEN VALIDATION
+# ============================================================
+
+async def validate_evm_token(
+    chain: str,
+    address: str,
+) -> Dict[str, Any]:
+    normalized_address = (
+        normalize_evm_address(
+            address
+        )
     )
 
-    if chain not in {
-        "bnb",
-        "ethereum",
-        "solana",
-        "robinhood",
-    }:
-        return {
-            "valid": False,
-            "launched": False,
-            "chain": chain,
-            "address": contract_address,
-            "reason": "Unsupported chain.",
-        }
-
-    # ---------------------------------------------------------
-    # SOLANA
-    # ---------------------------------------------------------
-
-    if chain == "solana":
-        if not is_solana_address(
-            contract_address
-        ):
-            return {
-                "valid": False,
-                "launched": False,
-                "chain": chain,
-                "address": contract_address,
-                "reason": "Invalid Solana token address.",
-            }
-
-        asset = await get_solana_asset(
-            contract_address
-        )
-
-        metadata = extract_solana_metadata(
-            asset
-        )
-
-        pair = await get_best_token_pair(
-            "solana",
-            contract_address,
-        )
-
-        if pair:
-            return {
-                "valid": True,
-                "launched": True,
-                "chain": chain,
-                "address": contract_address,
-                "name": (
-                    pair.get("name")
-                    or metadata.get("name")
-                    or "Unknown"
-                ),
-                "symbol": (
-                    pair.get("symbol")
-                    or metadata.get("symbol")
-                    or "UNKNOWN"
-                ),
-                "pair": pair,
-                "market_data": pair,
-                "launch_status": "LIVE",
-            }
-
-        # Helius confirmed that the asset exists.
-        if asset:
-            return {
-                "valid": True,
-                "launched": False,
-                "chain": chain,
-                "address": contract_address,
-                "name": (
-                    metadata.get("name")
-                    or "Unknown"
-                ),
-                "symbol": (
-                    metadata.get("symbol")
-                    or "UNKNOWN"
-                ),
-                "pair": None,
-                "market_data": None,
-                "launch_status": "PRE_LAUNCH",
-            }
-
-        return {
-            "valid": False,
-            "launched": False,
-            "chain": chain,
-            "address": contract_address,
-            "reason": (
-                "Solana token could not be verified."
-            ),
-        }
-
-    # ---------------------------------------------------------
-    # EVM CHAINS
-    # ---------------------------------------------------------
-
-    if not is_evm_address(
-        contract_address
-    ):
-        return {
-            "valid": False,
-            "launched": False,
-            "chain": chain,
-            "address": contract_address,
-            "reason": "Invalid EVM contract address.",
-        }
-
-    exists = await evm_contract_exists(
+    exists = await contract_exists(
         chain,
-        contract_address,
+        normalized_address,
     )
 
     if not exists:
@@ -475,74 +474,336 @@ async def validate_token(
             "valid": False,
             "launched": False,
             "chain": chain,
-            "address": contract_address,
+            "address": normalized_address,
             "reason": (
-                "No deployed contract was found "
-                "at this address."
+                "No deployed token contract "
+                "was found at this address."
             ),
         }
 
-    metadata = await get_evm_token_metadata(
-        chain,
-        contract_address,
+    metadata = (
+        await get_erc20_metadata(
+            chain,
+            normalized_address,
+        )
     )
 
-    # ---------------------------------------------------------
-    # LIVE PAIR CHECK
-    #
-    # DEX Screener now supports:
-    # BNB       -> bsc
-    # Ethereum  -> ethereum
-    # Robinhood -> robinhood
-    # ---------------------------------------------------------
-
-    pair = await get_best_token_pair(
+    pair = await get_pair_data(
         chain,
-        contract_address,
+        normalized_address,
     )
 
     if pair:
+        token_name = (
+            pair.get("name")
+            or metadata.get("name")
+            or "Unknown Token"
+        )
+
+        token_symbol = (
+            pair.get("symbol")
+            or metadata.get("symbol")
+            or "UNKNOWN"
+        )
+
         return {
             "valid": True,
             "launched": True,
+            "launch_status": "LIVE",
             "chain": chain,
-            "address": contract_address,
-            "name": (
-                pair.get("name")
-                or metadata.get("name")
-                or "Unknown"
+            "address": normalized_address,
+            "name": token_name,
+            "symbol": token_symbol,
+            "pair_address": pair.get(
+                "pair_address"
             ),
-            "symbol": (
-                pair.get("symbol")
-                or metadata.get("symbol")
-                or "UNKNOWN"
+            "dex": pair.get(
+                "dex"
+            ),
+            "dex_url": pair.get(
+                "dex_url"
+            ),
+            "url": pair.get(
+                "url"
+            ),
+            "price_usd": pair.get(
+                "price_usd"
+            ),
+            "market_cap": pair.get(
+                "market_cap"
+            ),
+            "fdv": pair.get(
+                "fdv"
+            ),
+            "liquidity_usd": pair.get(
+                "liquidity_usd"
+            ),
+            "volume_24h": pair.get(
+                "volume_24h"
+            ),
+            "price_change_24h": pair.get(
+                "price_change_24h"
+            ),
+            "buys_24h": pair.get(
+                "buys_24h"
+            ),
+            "sells_24h": pair.get(
+                "sells_24h"
             ),
             "pair": pair,
-            "market_data": pair,
-            "launch_status": "LIVE",
         }
 
-    # ---------------------------------------------------------
-    # VALID CONTRACT, NO LIVE PAIR
-    #
-    # This is important for pre-launch booking.
-    # The order can be paid now and monitored later.
-    # ---------------------------------------------------------
-
+    # Contract exists, but DEX Screener
+    # has no live pair yet.
     return {
         "valid": True,
         "launched": False,
+        "launch_status": "PRE_LAUNCH",
         "chain": chain,
-        "address": contract_address,
+        "address": normalized_address,
         "name": (
             metadata.get("name")
-            or "Unknown"
+            or "Unknown Token"
         ),
         "symbol": (
             metadata.get("symbol")
             or "UNKNOWN"
         ),
+        "pair_address": None,
+        "dex": None,
+        "dex_url": None,
+        "url": None,
+        "price_usd": None,
+        "market_cap": None,
+        "fdv": None,
+        "liquidity_usd": None,
+        "volume_24h": None,
+        "price_change_24h": None,
+        "buys_24h": None,
+        "sells_24h": None,
         "pair": None,
-        "market_data": None,
-        "launch_status": "PRE_LAUNCH",
     }
+
+
+# ============================================================
+# SOLANA TOKEN VALIDATION
+# ============================================================
+
+async def validate_solana_token(
+    address: str,
+) -> Dict[str, Any]:
+    asset = await get_solana_asset(
+        address
+    )
+
+    # Helius may return no asset for
+    # an invalid/nonexistent address.
+    if asset is None:
+        return {
+            "valid": False,
+            "launched": False,
+            "chain": "solana",
+            "address": address,
+            "reason": (
+                "The Solana token could not "
+                "be found."
+            ),
+        }
+
+    pair = await get_pair_data(
+        "solana",
+        address,
+    )
+
+    content = (
+        asset.get("content")
+        or {}
+    )
+
+    metadata = (
+        content.get("metadata")
+        or {}
+    )
+
+    token_name = (
+        metadata.get("name")
+        or "Unknown Token"
+    )
+
+    token_symbol = (
+        metadata.get("symbol")
+        or "UNKNOWN"
+    )
+
+    if pair:
+        token_name = (
+            pair.get("name")
+            or token_name
+        )
+
+        token_symbol = (
+            pair.get("symbol")
+            or token_symbol
+        )
+
+        return {
+            "valid": True,
+            "launched": True,
+            "launch_status": "LIVE",
+            "chain": "solana",
+            "address": address,
+            "name": token_name,
+            "symbol": token_symbol,
+            "pair_address": pair.get(
+                "pair_address"
+            ),
+            "dex": pair.get(
+                "dex"
+            ),
+            "dex_url": pair.get(
+                "dex_url"
+            ),
+            "url": pair.get(
+                "url"
+            ),
+            "price_usd": pair.get(
+                "price_usd"
+            ),
+            "market_cap": pair.get(
+                "market_cap"
+            ),
+            "fdv": pair.get(
+                "fdv"
+            ),
+            "liquidity_usd": pair.get(
+                "liquidity_usd"
+            ),
+            "volume_24h": pair.get(
+                "volume_24h"
+            ),
+            "price_change_24h": pair.get(
+                "price_change_24h"
+            ),
+            "buys_24h": pair.get(
+                "buys_24h"
+            ),
+            "sells_24h": pair.get(
+                "sells_24h"
+            ),
+            "pair": pair,
+        }
+
+    return {
+        "valid": True,
+        "launched": False,
+        "launch_status": "PRE_LAUNCH",
+        "chain": "solana",
+        "address": address,
+        "name": token_name,
+        "symbol": token_symbol,
+        "pair_address": None,
+        "dex": None,
+        "dex_url": None,
+        "url": None,
+        "price_usd": None,
+        "market_cap": None,
+        "fdv": None,
+        "liquidity_usd": None,
+        "volume_24h": None,
+        "price_change_24h": None,
+        "buys_24h": None,
+        "sells_24h": None,
+        "pair": None,
+    }
+
+
+# ============================================================
+# PUBLIC VALIDATOR
+# ============================================================
+
+async def validate_token(
+    chain: str,
+    address: str,
+) -> Dict[str, Any]:
+    chain = normalize_chain(
+        chain
+    )
+
+    address = (
+        str(address or "")
+        .strip()
+    )
+
+    if chain not in SUPPORTED_CHAINS:
+        return {
+            "valid": False,
+            "launched": False,
+            "chain": chain,
+            "address": address,
+            "reason": (
+                "Unsupported blockchain."
+            ),
+        }
+
+    if not address:
+        return {
+            "valid": False,
+            "launched": False,
+            "chain": chain,
+            "address": address,
+            "reason": (
+                "Token contract address "
+                "is required."
+            ),
+        }
+
+    if not is_valid_address(
+        chain,
+        address,
+    ):
+        return {
+            "valid": False,
+            "launched": False,
+            "chain": chain,
+            "address": address,
+            "reason": (
+                "Invalid token address "
+                "format for this chain."
+            ),
+        }
+
+    if chain in EVM_CHAINS:
+        return await validate_evm_token(
+            chain,
+            address,
+        )
+
+    if chain == "solana":
+        return await validate_solana_token(
+            address
+        )
+
+    return {
+        "valid": False,
+        "launched": False,
+        "chain": chain,
+        "address": address,
+        "reason": (
+            "Token validation is not "
+            "available for this chain."
+        ),
+    }
+
+
+# ============================================================
+# COMPATIBILITY ALIAS
+# ============================================================
+
+async def validate_token_address(
+    chain: str,
+    address: str,
+) -> Dict[str, Any]:
+    return await validate_token(
+        chain,
+        address,
+    )
