@@ -1,143 +1,157 @@
+from typing import Any
+
 import httpx
 
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 DEX_BASE_URL = (
     "https://api.dexscreener.com"
 )
 
+REQUEST_TIMEOUT = httpx.Timeout(
+    15.0,
+    connect=10.0,
+)
 
-REQUEST_TIMEOUT_SECONDS = 15
 
-
+# DEX Screener chain IDs.
+#
+# Robinhood Chain is represented by "robinhood"
+# on DEX Screener.
 CHAIN_MAP = {
     "bnb": "bsc",
+    "bsc": "bsc",
+    "binance": "bsc",
+    "binance smart chain": "bsc",
+
     "ethereum": "ethereum",
+    "eth": "ethereum",
+
     "solana": "solana",
+    "sol": "solana",
+
+    "robinhood": "robinhood",
+    "rh": "robinhood",
+    "robinhood chain": "robinhood",
 }
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def normalize_chain(
     chain: str,
-):
-    if not chain:
-        return None
-
-    value = str(
-        chain
+) -> str:
+    value = (
+        chain or ""
     ).strip().lower()
 
-    aliases = {
-        "bsc": "bnb",
-        "binance": "bnb",
-        "binance smart chain": "bnb",
-        "eth": "ethereum",
-        "ethereum": "ethereum",
-        "sol": "solana",
-        "solana": "solana",
-        "bnb": "bnb",
-        "robinhood": "robinhood",
-        "robinhood chain": "robinhood",
-        "rh": "robinhood",
-    }
-
-    return aliases.get(
-        value
-    )
-
-
-def dex_chain_id(
-    chain: str,
-):
-    normalized = normalize_chain(
-        chain
-    )
-
     return CHAIN_MAP.get(
-        normalized
+        value,
+        value,
     )
 
 
 def safe_float(
-    value,
-):
+    value: Any,
+    default: float = 0.0,
+) -> float:
     try:
-        return float(
-            value or 0
-        )
+        if value is None:
+            return default
+
+        return float(value)
 
     except (
-        ValueError,
         TypeError,
+        ValueError,
     ):
-        return 0.0
+        return default
 
 
 def safe_int(
-    value,
-):
+    value: Any,
+    default: int = 0,
+) -> int:
     try:
-        return int(
-            value or 0
-        )
+        if value is None:
+            return default
+
+        return int(value)
 
     except (
-        ValueError,
         TypeError,
+        ValueError,
     ):
-        return 0
+        return default
 
+
+def normalize_address(
+    address: str,
+) -> str:
+    return (
+        address or ""
+    ).strip().lower()
+
+
+# ============================================================
+# GET TOKEN PAIRS
+# ============================================================
 
 async def get_token_pairs(
     chain: str,
     contract_address: str,
-):
-    dex_chain = dex_chain_id(
+) -> list[dict]:
+    """
+    Return all DEX Screener pairs for a token.
+
+    Supported:
+        BNB Smart Chain
+        Ethereum
+        Solana
+        Robinhood Chain
+    """
+
+    chain_id = normalize_chain(
         chain
     )
 
-    if not dex_chain:
-        return []
-
-    if not contract_address:
-        return []
-
-    contract_address = str(
-        contract_address
+    contract_address = (
+        contract_address or ""
     ).strip()
 
-    if not contract_address:
+    if not chain_id or not contract_address:
         return []
 
     url = (
-        f"{DEX_BASE_URL}/latest/dex/tokens/"
+        f"{DEX_BASE_URL}"
+        f"/token-pairs/v1/"
+        f"{chain_id}/"
         f"{contract_address}"
     )
 
     try:
-
         async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT_SECONDS
+            timeout=REQUEST_TIMEOUT
         ) as client:
 
             response = await client.get(
-                url,
-                headers={
-                    "Accept": "application/json",
-                },
+                url
             )
 
             response.raise_for_status()
 
             data = response.json()
 
-    except (
-        httpx.HTTPError,
-        ValueError,
-    ) as exc:
-
+    except Exception as exc:
         print(
-            f"DEX Screener request failed "
-            f"for {chain}:{contract_address}: "
+            "DEX Screener token lookup error "
+            f"chain={chain_id} "
+            f"token={contract_address}: "
             f"{exc}"
         )
 
@@ -145,375 +159,391 @@ async def get_token_pairs(
 
     if not isinstance(
         data,
-        dict,
-    ):
-        return []
-
-    pairs = data.get(
-        "pairs"
-    ) or []
-
-    if not isinstance(
-        pairs,
         list,
     ):
         return []
 
-    # Only return pairs belonging to the
-    # selected chain.
-    return [
-        pair
-        for pair in pairs
-        if isinstance(
+    pairs = []
+
+    for pair in data:
+        if not isinstance(
             pair,
             dict,
-        )
-        and pair.get(
-            "chainId"
-        ) == dex_chain
-    ]
+        ):
+            continue
 
+        returned_chain = (
+            pair.get("chainId")
+            or ""
+        )
+
+        if (
+            returned_chain
+            and returned_chain.lower()
+            != chain_id.lower()
+        ):
+            continue
+
+        pairs.append(
+            pair
+        )
+
+    return pairs
+
+
+# ============================================================
+# CHOOSE BEST PAIR
+# ============================================================
 
 def choose_best_pair(
-    pairs,
-):
+    pairs: list[dict],
+) -> dict | None:
+    """
+    Select the most useful trading pair.
+
+    Priority:
+        1. Liquidity
+        2. 24h volume
+        3. Recent transaction activity
+    """
+
     if not pairs:
         return None
 
-    valid_pairs = [
-        pair
-        for pair in pairs
-        if isinstance(
-            pair,
-            dict,
-        )
-    ]
-
-    if not valid_pairs:
-        return None
-
     def pair_score(
-        pair,
+        pair: dict,
     ):
         liquidity = safe_float(
             (
-                pair.get(
-                    "liquidity"
-                )
+                pair.get("liquidity")
                 or {}
-            ).get(
-                "usd"
-            )
+            ).get("usd")
         )
 
-        volume = safe_float(
+        volume_24h = safe_float(
             (
-                pair.get(
-                    "volume"
-                )
+                pair.get("volume")
                 or {}
-            ).get(
-                "h24"
-            )
+            ).get("h24")
         )
 
-        transactions = (
-            pair.get(
-                "txns"
-            )
+        txns = (
+            pair.get("txns")
             or {}
         )
 
         h24 = (
-            transactions.get(
-                "h24"
-            )
+            txns.get("h24")
             or {}
         )
 
         buys = safe_int(
-            h24.get(
-                "buys"
-            )
+            h24.get("buys")
         )
 
         sells = safe_int(
-            h24.get(
-                "sells"
-            )
+            h24.get("sells")
         )
 
-        activity = (
+        transactions = (
             buys + sells
         )
 
-        # Liquidity is the primary selection factor.
-        # Volume/activity break ties between otherwise
-        # similarly liquid pairs.
         return (
             liquidity,
-            volume,
-            activity,
+            volume_24h,
+            transactions,
         )
 
     return max(
-        valid_pairs,
+        pairs,
         key=pair_score,
     )
 
 
+# Backward-compatible alias.
+choose_best_pair = choose_best_pair
+
+
+# ============================================================
+# PARSE PAIR
+# ============================================================
+
 def parse_pair(
-    pair,
-):
-    if not pair:
-        return None
+    pair: dict,
+) -> dict:
+    """
+    Convert raw DEX Screener pair data into
+    the normalized structure used by the bot.
+    """
 
-    if not isinstance(
-        pair,
-        dict,
-    ):
-        return None
-
-    base = (
-        pair.get(
-            "baseToken"
-        )
+    base_token = (
+        pair.get("baseToken")
         or {}
     )
 
-    liquidity = (
-        pair.get(
-            "liquidity"
-        )
-        or {}
-    )
-
-    volume = (
-        pair.get(
-            "volume"
-        )
-        or {}
-    )
-
-    price_change = (
-        pair.get(
-            "priceChange"
-        )
+    quote_token = (
+        pair.get("quoteToken")
         or {}
     )
 
     txns = (
-        pair.get(
-            "txns"
-        )
+        pair.get("txns")
         or {}
     )
 
-    h24_txns = (
-        txns.get(
-            "h24"
-        )
+    volume = (
+        pair.get("volume")
         or {}
+    )
+
+    price_change = (
+        pair.get("priceChange")
+        or {}
+    )
+
+    liquidity = (
+        pair.get("liquidity")
+        or {}
+    )
+
+    h5 = (
+        txns.get("m5")
+        or {}
+    )
+
+    h1 = (
+        txns.get("h1")
+        or {}
+    )
+
+    h6 = (
+        txns.get("h6")
+        or {}
+    )
+
+    h24 = (
+        txns.get("h24")
+        or {}
+    )
+
+    base_address = (
+        base_token.get("address")
+        or ""
     )
 
     return {
-        "name": base.get(
-            "name"
+        # ----------------------------------------------------
+        # Basic token information
+        # ----------------------------------------------------
+
+        "name": (
+            base_token.get("name")
+            or "Unknown"
         ),
 
-        "symbol": base.get(
-            "symbol"
+        "symbol": (
+            base_token.get("symbol")
+            or "UNKNOWN"
         ),
 
-        "address": base.get(
-            "address"
+        "address": base_address,
+
+        # ----------------------------------------------------
+        # Pair information
+        # ----------------------------------------------------
+
+        "pair_address": (
+            pair.get("pairAddress")
+            or ""
         ),
 
-        "pair_address": pair.get(
-            "pairAddress"
+        "dex": (
+            pair.get("dexId")
+            or "Unknown"
         ),
 
-        "dex": pair.get(
-            "dexId"
+        "chain": (
+            pair.get("chainId")
+            or ""
         ),
+
+        "url": (
+            pair.get("url")
+            or ""
+        ),
+
+        "dex_url": (
+            pair.get("url")
+            or ""
+        ),
+
+        # ----------------------------------------------------
+        # Price
+        # ----------------------------------------------------
 
         "price_usd": safe_float(
-            pair.get(
-                "priceUsd"
-            )
+            pair.get("priceUsd")
         ),
+
+        "price_native": safe_float(
+            pair.get("priceNative")
+        ),
+
+        # ----------------------------------------------------
+        # Liquidity / valuation
+        # ----------------------------------------------------
 
         "liquidity_usd": safe_float(
-            liquidity.get(
-                "usd"
-            )
+            liquidity.get("usd")
         ),
 
-        "volume_24h": safe_float(
-            volume.get(
-                "h24"
-            )
+        "liquidity_base": safe_float(
+            liquidity.get("base")
+        ),
+
+        "liquidity_quote": safe_float(
+            liquidity.get("quote")
         ),
 
         "market_cap": safe_float(
-            pair.get(
-                "marketCap"
-            )
+            pair.get("marketCap")
         ),
 
         "fdv": safe_float(
-            pair.get(
-                "fdv"
-            )
+            pair.get("fdv")
         ),
 
+        # ----------------------------------------------------
+        # Volume
+        # ----------------------------------------------------
+
+        "volume_5m": safe_float(
+            volume.get("m5")
+        ),
+
+        "volume_1h": safe_float(
+            volume.get("h1")
+        ),
+
+        "volume_6h": safe_float(
+            volume.get("h6")
+        ),
+
+        "volume_24h": safe_float(
+            volume.get("h24")
+        ),
+
+        # ----------------------------------------------------
+        # Price changes
+        # ----------------------------------------------------
+
         "price_change_5m": safe_float(
-            price_change.get(
-                "m5"
-            )
+            price_change.get("m5")
         ),
 
         "price_change_1h": safe_float(
-            price_change.get(
-                "h1"
-            )
+            price_change.get("h1")
         ),
 
         "price_change_6h": safe_float(
-            price_change.get(
-                "h6"
-            )
+            price_change.get("h6")
         ),
 
         "price_change_24h": safe_float(
-            price_change.get(
-                "h24"
-            )
+            price_change.get("h24")
         ),
 
+        # ----------------------------------------------------
+        # Buy / sell activity
+        # ----------------------------------------------------
+
         "buys_5m": safe_int(
-            (
-                txns.get(
-                    "m5"
-                )
-                or {}
-            ).get(
-                "buys"
-            )
+            h5.get("buys")
         ),
 
         "sells_5m": safe_int(
-            (
-                txns.get(
-                    "m5"
-                )
-                or {}
-            ).get(
-                "sells"
-            )
+            h5.get("sells")
         ),
 
         "buys_1h": safe_int(
-            (
-                txns.get(
-                    "h1"
-                )
-                or {}
-            ).get(
-                "buys"
-            )
+            h1.get("buys")
         ),
 
         "sells_1h": safe_int(
-            (
-                txns.get(
-                    "h1"
-                )
-                or {}
-            ).get(
-                "sells"
-            )
+            h1.get("sells")
         ),
 
         "buys_6h": safe_int(
-            (
-                txns.get(
-                    "h6"
-                )
-                or {}
-            ).get(
-                "buys"
-            )
+            h6.get("buys")
         ),
 
         "sells_6h": safe_int(
-            (
-                txns.get(
-                    "h6"
-                )
-                or {}
-            ).get(
-                "sells"
-            )
+            h6.get("sells")
         ),
 
         "buys_24h": safe_int(
-            h24_txns.get(
-                "buys"
-            )
+            h24.get("buys")
         ),
 
         "sells_24h": safe_int(
-            h24_txns.get(
-                "sells"
-            )
+            h24.get("sells")
         ),
+
+        # ----------------------------------------------------
+        # Pair age
+        # ----------------------------------------------------
 
         "pair_created_at": pair.get(
             "pairCreatedAt"
         ),
 
-        "url": pair.get(
-            "url"
+        # ----------------------------------------------------
+        # Quote token
+        # ----------------------------------------------------
+
+        "quote_token_address": (
+            quote_token.get("address")
+            or ""
         ),
 
-        "dex_url": pair.get(
-            "url"
+        "quote_token_name": (
+            quote_token.get("name")
+            or ""
         ),
 
-        "quote_token": (
-            pair.get(
-                "quoteToken"
-            )
-            or {}
-        ).get(
-            "address"
+        "quote_token_symbol": (
+            quote_token.get("symbol")
+            or ""
         ),
 
-        "quote_symbol": (
-            pair.get(
-                "quoteToken"
-            )
-            or {}
-        ).get(
-            "symbol"
+        # ----------------------------------------------------
+        # DEX metadata
+        # ----------------------------------------------------
+
+        "labels": (
+            pair.get("labels")
+            or []
         ),
 
-        "quote_name": (
-            pair.get(
-                "quoteToken"
-            )
-            or {}
-        ).get(
-            "name"
+        "image_url": (
+            (
+                pair.get("info")
+                or {}
+            ).get("imageUrl")
+            or ""
         ),
     }
 
 
+# ============================================================
+# GET BEST TOKEN PAIR
+# ============================================================
+
 async def get_best_token_pair(
     chain: str,
     contract_address: str,
-):
+) -> dict | None:
     pairs = await get_token_pairs(
         chain,
         contract_address,
@@ -528,4 +558,22 @@ async def get_best_token_pair(
 
     return parse_pair(
         pair
+    )
+
+
+# ============================================================
+# COMPATIBILITY HELPERS
+# ============================================================
+
+async def get_token_market_data(
+    chain: str,
+    contract_address: str,
+) -> dict | None:
+    """
+    Compatibility helper used by older services.
+    """
+
+    return await get_best_token_pair(
+        chain,
+        contract_address,
     )
