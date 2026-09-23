@@ -4,19 +4,19 @@ from telegram import Update
 
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
 
 from config import BOT_TOKEN
 
 from database.connection import (
-    init_db,
     close_db,
+    init_db,
 )
 
 from handlers.start import start_command
@@ -34,11 +34,12 @@ from handlers.wallets import (
     show_wallets,
 )
 
-from handlers.buybot import (
+from services.buybot import (
     activate_buybot,
     remove_buybot,
     list_tokens,
     build_buybot_conversation,
+    register_buybot_callbacks,
 )
 
 from handlers.trending import (
@@ -253,130 +254,33 @@ async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message:
+        return
+
     await update.message.reply_text(
-        "🏛️ *THE BLOCK ROOM*\n\n"
+        "🏛️ THE BLOCK ROOM\n\n"
         "📈 /trend — List a token on trending\n"
-        "💰 /prices — View trending packages\n"
-        "🤖 /buybot — Manage BuyBot in a group\n"
+        "💰 /prices — View trending packages\n\n"
+        "🤖 /buybot — Manage BuyBot\n"
         "➕ /add — Add BuyBot token\n"
         "➖ /remove — Remove BuyBot token\n"
-        "📋 /tokens — View monitored tokens\n"
+        "📋 /tokens — View monitored tokens\n\n"
         "💬 /support — Contact support\n"
         "❓ /help — Show help",
-        parse_mode="Markdown",
     )
 
 
-def main():
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(False)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "adminhelp",
-            admin_help,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "activebuybot",
-            activate_buybot,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "removebuybot",
-            remove_buybot,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            [
-                "2hour",
-                "6hours",
-                "12hours",
-                "24hours",
-            ],
-            set_price,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "prices",
-            show_prices,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            [
-                "BNB",
-                "ETH",
-                "SOL",
-            ],
-            set_wallet,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            [
-                "removeBNB",
-                "removeETH",
-                "removeSOL",
-            ],
-            remove_wallet,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "wallets",
-            show_wallets,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "tokens",
-            list_tokens,
-        )
-    )
-
-    application.add_handler(
-        build_buybot_conversation()
-    )
-
-    trend_conversation = ConversationHandler(
+def build_trend_conversation():
+    return ConversationHandler(
         entry_points=[
             CommandHandler(
                 "trend",
                 trend_start,
-            )
+            ),
+            CommandHandler(
+                "trending",
+                trend_start,
+            ),
         ],
         states={
             SELECT_CHAIN: [
@@ -429,8 +333,138 @@ def main():
         allow_reentry=True,
     )
 
+
+def main():
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(False)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # =========================
+    # BASIC COMMANDS
+    # =========================
+
     application.add_handler(
-        trend_conversation
+        CommandHandler(
+            "start",
+            start_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "adminhelp",
+            admin_help,
+        )
+    )
+
+    # =========================
+    # PRICING
+    # =========================
+
+    application.add_handler(
+        CommandHandler(
+            [
+                "2hour",
+                "6hours",
+                "12hours",
+                "24hours",
+            ],
+            set_price,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "prices",
+            show_prices,
+        )
+    )
+
+    # =========================
+    # PAYMENT WALLETS
+    # =========================
+
+    application.add_handler(
+        CommandHandler(
+            [
+                "BNB",
+                "ETH",
+                "SOL",
+            ],
+            set_wallet,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            [
+                "removeBNB",
+                "removeETH",
+                "removeSOL",
+            ],
+            remove_wallet,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "wallets",
+            show_wallets,
+        )
+    )
+
+    # =========================
+    # BUYBOT
+    # =========================
+
+    application.add_handler(
+        CommandHandler(
+            "activebuybot",
+            activate_buybot,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removebuybot",
+            remove_buybot,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "tokens",
+            list_tokens,
+        )
+    )
+
+    application.add_handler(
+        build_buybot_conversation()
+    )
+
+    # Register BuyBot inline-button callbacks.
+    register_buybot_callbacks(
+        application
+    )
+
+    # =========================
+    # TRENDING
+    # =========================
+
+    application.add_handler(
+        build_trend_conversation()
     )
 
     print(
