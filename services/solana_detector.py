@@ -1,16 +1,9 @@
-from __future__ import annotations
-
 import asyncio
-from decimal import Decimal
+from typing import Any, Dict, List, Optional
 
 import httpx
-from telegram import Bot
 
-from config import (
-    BOT_TOKEN,
-    HELIUS_API_KEY,
-    BUYBOT_POLL_SECONDS,
-)
+from config import HELIUS_API_KEY, BUYBOT_POLL_SECONDS
 
 from database.connection import get_pool
 
@@ -24,29 +17,77 @@ from services.market_data import (
 )
 
 
-# ============================================================
-# HELIUS CONFIGURATION
-# ============================================================
+HELIUS_RPC_URL = (
+    "https://mainnet.helius-rpc.com/"
+)
 
-HELIUS_BASE_URL = (
+HELIUS_API_URL = (
     "https://api.helius.xyz"
 )
 
-HELIUS_TRANSACTION_URL = (
-    f"{HELIUS_BASE_URL}/v0/transactions"
-)
+
+CHAIN = "solana"
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+async def helius_rpc(
+    method: str,
+    params: List[Any],
+) -> Optional[Any]:
+    if not HELIUS_API_KEY:
+        print(
+            "HELIUS_API_KEY is not configured."
+        )
+        return None
 
-async def get_solana_tokens():
+    url = (
+        f"{HELIUS_RPC_URL}"
+        f"?api-key={HELIUS_API_KEY}"
+    )
 
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "the-block-room",
+        "method": method,
+        "params": params,
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=25
+        ) as client:
+            response = await client.post(
+                url,
+                json=payload,
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if "error" in data:
+                print(
+                    "Helius RPC error "
+                    f"method={method}: "
+                    f"{data['error']}"
+                )
+                return None
+
+            return data.get(
+                "result"
+            )
+
+    except Exception as exc:
+        print(
+            "Helius RPC request error "
+            f"method={method}: {exc}"
+        )
+        return None
+
+
+async def get_monitored_tokens() -> List[Dict[str, Any]]:
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-
         rows = await connection.fetch(
             """
             SELECT
@@ -55,43 +96,494 @@ async def get_solana_tokens():
                 chain,
                 contract_address,
                 token_name,
-                token_symbol,
-                pair_address,
-                dex_url
+                token_symbol
             FROM buybot_tokens
             WHERE enabled = TRUE
-              AND chain = 'SOL'
-            ORDER BY id ASC
+              AND LOWER(chain) = 'solana'
+            ORDER BY id ASC;
             """
         )
 
-    return rows
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
-async def event_exists(
+async def get_last_signature(
     group_id: int,
-    chain: str,
+    token_address: str,
+) -> Optional[str]:
+    pool = await get_pool()
+
+    key = (
+        "buybot_solana_last_signature:"
+        f"{group_id}:"
+        f"{token_address.lower()}"
+    )
+
+    async with pool.acquire() as connection:
+        row = await connection.fetchrow(
+            """
+            SELECT value
+            FROM system_settings
+            WHERE key = $1;
+            """,
+            key,
+        )
+
+    if not row:
+        return None
+
+    return row["value"]
+
+
+async def save_last_signature(
+    group_id: int,
+    token_address: str,
+    signature: str,
+):
+    pool = await get_pool()
+
+    key = (
+        "buybot_solana_last_signature:"
+        f"{group_id}:"
+        f"{token_address.lower()}"
+    )
+
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO system_settings (
+                key,
+                value
+            )
+            VALUES ($1, $2)
+            ON CONFLICT (key)
+            DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = NOW();
+            """,
+            key,
+            signature,
+        )
+
+
+async def get_token_signatures(
+    token_address: str,
+    before: Optional[str] = None,
+    limit: int = 100,
+) -> List[str]:
+    params = [
+        token_address,
+        {
+            "limit": limit,
+        },
+    ]
+
+    if before:
+        params[1]["before"] = before
+
+    result = await helius_rpc(
+        "getSignaturesForAddress",
+        params,
+    )
+
+    if not isinstance(
+        result,
+        list,
+    ):
+        return []
+
+    signatures = []
+
+    for item in result:
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        signature = item.get(
+            "signature"
+        )
+
+        if signature:
+            signatures.append(
+                signature
+            )
+
+    return signatures
+
+
+async def get_parsed_transaction(
+    signature: str,
+) -> Optional[Dict[str, Any]]:
+    result = await helius_rpc(
+        "getTransaction",
+        [
+            signature,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "finalized",
+                "maxSupportedTransactionVersion": 0,
+            },
+        ],
+    )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return None
+
+    return result
+
+
+def is_failed_transaction(
+    transaction: Dict[str, Any],
+) -> bool:
+    meta = transaction.get(
+        "meta"
+    )
+
+    if not isinstance(
+        meta,
+        dict,
+    ):
+        return True
+
+    return meta.get(
+        "err"
+    ) is not None
+
+
+def get_account_keys(
+    transaction: Dict[str, Any],
+) -> List[str]:
+    message = (
+        transaction
+        .get("transaction", {})
+        .get("message", {})
+    )
+
+    account_keys = message.get(
+        "accountKeys",
+        [],
+    )
+
+    result = []
+
+    for item in account_keys:
+        if isinstance(
+            item,
+            str,
+        ):
+            result.append(
+                item
+            )
+            continue
+
+        if isinstance(
+            item,
+            dict,
+        ):
+            pubkey = item.get(
+                "pubkey"
+            )
+
+            if pubkey:
+                result.append(
+                    pubkey
+                )
+
+    return result
+
+
+def extract_token_balance_changes(
+    transaction: Dict[str, Any],
+    token_address: str,
+) -> List[Dict[str, Any]]:
+    meta = transaction.get(
+        "meta",
+        {}
+    )
+
+    pre_balances = meta.get(
+        "preTokenBalances",
+        []
+    )
+
+    post_balances = meta.get(
+        "postTokenBalances",
+        []
+    )
+
+    pre_map = {}
+    post_map = {}
+
+    for balance in pre_balances:
+        if not isinstance(
+            balance,
+            dict,
+        ):
+            continue
+
+        if balance.get(
+            "mint"
+        ) != token_address:
+            continue
+
+        index = balance.get(
+            "accountIndex"
+        )
+
+        amount = (
+            balance
+            .get("uiTokenAmount", {})
+            .get("uiAmount")
+        )
+
+        if amount is None:
+            amount = 0
+
+        pre_map[index] = float(
+            amount
+        )
+
+    for balance in post_balances:
+        if not isinstance(
+            balance,
+            dict,
+        ):
+            continue
+
+        if balance.get(
+            "mint"
+        ) != token_address:
+            continue
+
+        index = balance.get(
+            "accountIndex"
+        )
+
+        amount = (
+            balance
+            .get("uiTokenAmount", {})
+            .get("uiAmount")
+        )
+
+        if amount is None:
+            amount = 0
+
+        post_map[index] = float(
+            amount
+        )
+
+    changes = []
+
+    all_indexes = (
+        set(pre_map)
+        | set(post_map)
+    )
+
+    for index in all_indexes:
+        before = pre_map.get(
+            index,
+            0.0,
+        )
+
+        after = post_map.get(
+            index,
+            0.0,
+        )
+
+        delta = after - before
+
+        if delta <= 0:
+            continue
+
+        changes.append(
+            {
+                "account_index": index,
+                "amount": delta,
+            }
+        )
+
+    return changes
+
+
+def find_buyer_for_token_change(
+    transaction: Dict[str, Any],
+    account_index: Optional[int],
+) -> str:
+    if account_index is None:
+        return ""
+
+    keys = get_account_keys(
+        transaction
+    )
+
+    if (
+        account_index >= 0
+        and account_index < len(keys)
+    ):
+        return keys[
+            account_index
+        ]
+
+    return ""
+
+
+def extract_sol_spent(
+    transaction: Dict[str, Any],
+    buyer_address: str,
+) -> float:
+    meta = transaction.get(
+        "meta",
+        {}
+    )
+
+    pre_balances = meta.get(
+        "preBalances",
+        []
+    )
+
+    post_balances = meta.get(
+        "postBalances",
+        []
+    )
+
+    keys = get_account_keys(
+        transaction
+    )
+
+    if not buyer_address:
+        return 0.0
+
+    try:
+        buyer_index = keys.index(
+            buyer_address
+        )
+
+    except ValueError:
+        return 0.0
+
+    if (
+        buyer_index >= len(
+            pre_balances
+        )
+        or buyer_index >= len(
+            post_balances
+        )
+    ):
+        return 0.0
+
+    pre = float(
+        pre_balances[
+            buyer_index
+        ]
+    )
+
+    post = float(
+        post_balances[
+            buyer_index
+        ]
+    )
+
+    # Lamports -> SOL.
+    #
+    # A buyer normally loses SOL for the swap,
+    # but transaction fees also reduce the balance.
+    # We use the actual balance reduction as the
+    # conservative amount spent.
+    spent_lamports = (
+        pre - post
+    )
+
+    if spent_lamports <= 0:
+        return 0.0
+
+    return (
+        spent_lamports
+        / 1_000_000_000
+    )
+
+
+def extract_token_received_amount(
+    transaction: Dict[str, Any],
+    token_address: str,
+) -> float:
+    changes = extract_token_balance_changes(
+        transaction,
+        token_address,
+    )
+
+    if not changes:
+        return 0.0
+
+    return max(
+        change["amount"]
+        for change in changes
+    )
+
+
+def find_best_token_buyer(
+    transaction: Dict[str, Any],
+    token_address: str,
+) -> Dict[str, Any]:
+    changes = extract_token_balance_changes(
+        transaction,
+        token_address,
+    )
+
+    if not changes:
+        return {
+            "buyer": "",
+            "amount": 0.0,
+        }
+
+    best = max(
+        changes,
+        key=lambda item: item[
+            "amount"
+        ],
+    )
+
+    buyer = find_buyer_for_token_change(
+        transaction,
+        best.get(
+            "account_index"
+        ),
+    )
+
+    return {
+        "buyer": buyer,
+        "amount": best[
+            "amount"
+        ],
+    }
+
+
+async def event_already_processed(
+    group_id: int,
     tx_hash: str,
     token_address: str,
 ) -> bool:
-
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-
         row = await connection.fetchrow(
             """
-            SELECT 1
+            SELECT id
             FROM buybot_events
             WHERE group_id = $1
-              AND chain = $2
-              AND tx_hash = $3
-              AND LOWER(token_address)
-                    = LOWER($4)
-            LIMIT 1
+              AND LOWER(chain) = 'solana'
+              AND LOWER(tx_hash) = LOWER($2)
+              AND LOWER(token_address) = LOWER($3)
+            LIMIT 1;
             """,
             group_id,
-            chain,
             tx_hash,
             token_address,
         )
@@ -99,21 +591,18 @@ async def event_exists(
     return row is not None
 
 
-async def save_event(
+async def save_buy_event(
     group_id: int,
-    chain: str,
     tx_hash: str,
     token_address: str,
-    token_symbol: str | None,
-    buyer_address: str | None,
-    spent_amount_usd: Decimal,
-    received_amount: Decimal,
+    token_symbol: str,
+    buyer_address: str,
+    spent_amount_usd: float,
+    received_amount: float,
 ):
-
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-
         await connection.execute(
             """
             INSERT INTO buybot_events (
@@ -128,18 +617,23 @@ async def save_event(
             )
             VALUES (
                 $1,
+                'solana',
                 $2,
                 $3,
                 $4,
                 $5,
                 $6,
-                $7,
-                $8
+                $7
             )
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (
+                group_id,
+                chain,
+                tx_hash,
+                token_address
+            )
+            DO NOTHING;
             """,
             group_id,
-            chain,
             tx_hash,
             token_address,
             token_symbol,
@@ -149,786 +643,257 @@ async def save_event(
         )
 
 
-async def get_buybot_settings(
-    group_id: int,
-):
-
-    pool = await get_pool()
-
-    async with pool.acquire() as connection:
-
-        return await connection.fetchrow(
-            """
-            SELECT
-                enabled,
-                min_buy_usd
-            FROM buybot_settings
-            WHERE group_id = $1
-            """,
-            group_id,
-        )
-
-
-# ============================================================
-# HELIUS API
-# ============================================================
-
-async def get_token_transactions(
-    token_address: str,
-):
-
-    if not HELIUS_API_KEY:
-
-        print(
-            "HELIUS_API_KEY is not configured."
-        )
-
-        return []
-
-    url = (
-        f"{HELIUS_BASE_URL}/v0/addresses/"
-        f"{token_address}/transactions"
-    )
-
-    params = {
-        "api-key": HELIUS_API_KEY,
-        "limit": 100,
-    }
-
-    try:
-
-        timeout = httpx.Timeout(
-            30.0,
-            connect=10.0,
-        )
-
-        async with httpx.AsyncClient(
-            timeout=timeout,
-        ) as client:
-
-            response = await client.get(
-                url,
-                params=params,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-        if not isinstance(
-            data,
-            list,
-        ):
-            return []
-
-        return data
-
-    except Exception as exc:
-
-        print(
-            "Helius transaction request "
-            f"failed for {token_address}: "
-            f"{exc}"
-        )
-
-        return []
-
-
-async def get_transaction(
+async def process_transaction(
+    token: Dict[str, Any],
     signature: str,
 ):
+    group_id = token[
+        "group_id"
+    ]
 
-    if not HELIUS_API_KEY:
-        return None
+    token_address = token[
+        "contract_address"
+    ]
 
-    params = {
-        "api-key": HELIUS_API_KEY,
-    }
+    token_symbol = (
+        token.get(
+            "token_symbol"
+        )
+        or "TOKEN"
+    )
 
-    payload = {
-        "transactions": [
-            signature
-        ],
-    }
+    if await event_already_processed(
+        group_id,
+        signature,
+        token_address,
+    ):
+        return
+
+    transaction = await get_parsed_transaction(
+        signature
+    )
+
+    if not transaction:
+        return
+
+    if is_failed_transaction(
+        transaction
+    ):
+        return
+
+    buyer_info = find_best_token_buyer(
+        transaction,
+        token_address,
+    )
+
+    buyer_address = buyer_info.get(
+        "buyer"
+    )
+
+    received_amount = buyer_info.get(
+        "amount",
+        0.0,
+    )
+
+    if not buyer_address:
+        return
+
+    if received_amount <= 0:
+        return
+
+    sol_spent = extract_sol_spent(
+        transaction,
+        buyer_address,
+    )
+
+    if sol_spent <= 0:
+        return
+
+    sol_price = await get_sol_price_usd()
+
+    if sol_price <= 0:
+        return
+
+    spent_usd = (
+        sol_spent
+        * sol_price
+    )
+
+    if spent_usd <= 0:
+        return
+
+    market_data = await get_market_data_safe(
+        "solana",
+        token_address,
+    )
+
+    if not market_data:
+        return
 
     try:
-
-        timeout = httpx.Timeout(
-            30.0,
-            connect=10.0,
+        sent = await send_buy_alert(
+            group_id=group_id,
+            chain="solana",
+            token_name=(
+                token.get(
+                    "token_name"
+                )
+                or market_data.get(
+                    "name"
+                )
+                or "Unknown"
+            ),
+            token_symbol=(
+                token_symbol
+                or market_data.get(
+                    "symbol"
+                )
+                or "TOKEN"
+            ),
+            spent_amount_usd=spent_usd,
+            received_amount=received_amount,
+            buyer_address=buyer_address,
+            tx_hash=signature,
+            market_data=market_data,
         )
 
-        async with httpx.AsyncClient(
-            timeout=timeout,
-        ) as client:
-
-            response = await client.post(
-                HELIUS_TRANSACTION_URL,
-                params=params,
-                json=payload,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-        if not isinstance(
-            data,
-            list,
-        ):
-            return None
-
-        if not data:
-            return None
-
-        return data[0]
+        if not sent:
+            return
 
     except Exception as exc:
-
         print(
-            "Helius parsed transaction "
-            f"request failed: {exc}"
+            "Solana BuyBot alert error "
+            f"group={group_id} "
+            f"tx={signature}: {exc}"
         )
+        return
 
-        return None
-
-
-# ============================================================
-# SOLANA BUY EXTRACTION
-# ============================================================
-
-def extract_buy(
-    transaction: dict,
-    token_address: str,
-) -> dict | None:
-
-    token_address = (
-        str(token_address)
-        .strip()
-        .lower()
-    )
-
-    events = transaction.get(
-        "events",
-        {},
-    )
-
-    token_swap = events.get(
-        "swap",
-        {},
-    )
-
-    if not isinstance(
-        token_swap,
-        dict,
-    ):
-        return None
-
-    token_inputs = (
-        token_swap.get(
-            "tokenInputs",
-            [],
-        )
-        or []
-    )
-
-    token_outputs = (
-        token_swap.get(
-            "tokenOutputs",
-            [],
-        )
-        or []
-    )
-
-    # ========================================================
-    # MONITORED TOKEN OUTPUT
-    # ========================================================
-
-    received = None
-
-    for output in token_outputs:
-
-        if not isinstance(
-            output,
-            dict,
-        ):
-            continue
-
-        mint = (
-            output.get(
-                "mint"
+    await save_buy_event(
+        group_id=group_id,
+        tx_hash=signature,
+        token_address=token_address,
+        token_symbol=(
+            token_symbol
+            or market_data.get(
+                "symbol"
             )
-            or output.get(
-                "tokenAddress"
-            )
-        )
-
-        if not mint:
-            continue
-
-        if (
-            str(mint).lower()
-            != token_address
-        ):
-            continue
-
-        raw_token_amount = (
-            output.get(
-                "rawTokenAmount",
-                {},
-            )
-            or {}
-        )
-
-        amount = (
-            raw_token_amount.get(
-                "tokenAmount"
-            )
-        )
-
-        decimals = (
-            raw_token_amount.get(
-                "decimals"
-            )
-        )
-
-        if amount is None:
-
-            amount = output.get(
-                "amount"
-            )
-
-        if decimals is None:
-
-            decimals = output.get(
-                "decimals",
-                0,
-            )
-
-        try:
-
-            raw_amount = Decimal(
-                str(amount)
-            )
-
-            decimals_int = int(
-                decimals
-            )
-
-            received_amount = (
-                raw_amount
-                / (
-                    Decimal(10)
-                    ** decimals_int
-                )
-            )
-
-        except Exception:
-
-            continue
-
-        received = {
-            "amount": received_amount,
-            "raw_amount": raw_amount,
-            "decimals": decimals_int,
-        }
-
-        break
-
-    if not received:
-        return None
-
-    # ========================================================
-    # BUYER
-    # ========================================================
-
-    buyer = (
-        transaction.get(
-            "feePayer"
-        )
-        or transaction.get(
-            "source"
-        )
-    )
-
-    # ========================================================
-    # SOL INPUT
-    # ========================================================
-
-    spent_sol = Decimal(
-        "0"
-    )
-
-    native_input = (
-        token_swap.get(
-            "nativeInput"
-        )
-    )
-
-    if isinstance(
-        native_input,
-        dict,
-    ):
-
-        try:
-
-            lamports = Decimal(
-                str(
-                    native_input.get(
-                        "amount",
-                        0,
-                    )
-                )
-            )
-
-            spent_sol = (
-                lamports
-                / Decimal(
-                    1_000_000_000
-                )
-            )
-
-        except Exception:
-
-            spent_sol = Decimal(
-                "0"
-            )
-
-    # ========================================================
-    # TOKEN INPUT
-    # ========================================================
-
-    spent_token = Decimal(
-        "0"
-    )
-
-    for item in token_inputs:
-
-        if not isinstance(
-            item,
-            dict,
-        ):
-            continue
-
-        raw_token_amount = (
-            item.get(
-                "rawTokenAmount",
-                {},
-            )
-            or {}
-        )
-
-        amount = (
-            raw_token_amount.get(
-                "tokenAmount"
-            )
-        )
-
-        decimals = (
-            raw_token_amount.get(
-                "decimals"
-            )
-        )
-
-        if amount is None:
-
-            amount = item.get(
-                "amount"
-            )
-
-        if decimals is None:
-
-            decimals = item.get(
-                "decimals",
-                0,
-            )
-
-        try:
-
-            value = (
-                Decimal(
-                    str(amount)
-                )
-                / (
-                    Decimal(10)
-                    ** int(decimals)
-                )
-            )
-
-        except Exception:
-
-            continue
-
-        spent_token = max(
-            spent_token,
-            value,
-        )
-
-    # ========================================================
-    # SIGNATURE
-    # ========================================================
-
-    signature = (
-        transaction.get(
-            "signature"
-        )
-        or transaction.get(
-            "transactionSignature"
-        )
-    )
-
-    if not signature:
-        return None
-
-    return {
-        "buyer": buyer,
-        "received_amount": (
-            received["amount"]
+            or "TOKEN"
         ),
-        "spent_sol": spent_sol,
-        "spent_token": spent_token,
-        "signature": signature,
-    }
+        buyer_address=buyer_address,
+        spent_amount_usd=spent_usd,
+        received_amount=received_amount,
+    )
 
-
-# ============================================================
-# PROCESS ONE TOKEN
-# ============================================================
 
 async def process_token(
-    token,
+    token: Dict[str, Any],
 ):
+    group_id = token[
+        "group_id"
+    ]
 
-    token_address = str(
-        token[
-            "contract_address"
-        ]
+    token_address = token[
+        "contract_address"
+    ]
+
+    last_signature = await get_last_signature(
+        group_id,
+        token_address,
     )
 
-    group_id = int(
-        token["group_id"]
+    signatures = await get_token_signatures(
+        token_address,
+        limit=100,
     )
 
-    settings = (
-        await get_buybot_settings(
-            group_id
-        )
-    )
-
-    if not settings:
+    if not signatures:
         return
 
-    if not settings["enabled"]:
-        return
+    # getSignaturesForAddress returns newest first.
+    #
+    # Process oldest -> newest so alerts appear
+    # in chronological order.
+    if last_signature:
+        if last_signature in signatures:
+            index = signatures.index(
+                last_signature
+            )
 
-    transactions = (
-        await get_token_transactions(
-            token_address
-        )
-    )
-
-    if not transactions:
-        return
-
-    minimum_buy = Decimal(
-        str(
-            settings[
-                "min_buy_usd"
+            signatures = signatures[
+                :index
             ]
-            or 0
-        )
-    )
 
-    # ========================================================
-    # SOL PRICE
-    # ========================================================
+    signatures.reverse()
 
-    sol_price_usd = None
+    if not signatures:
+        return
 
-    if minimum_buy > 0:
+    newest_processed = None
 
+    for signature in signatures:
         try:
-
-            sol_price_usd = (
-                await get_sol_price_usd()
+            await process_transaction(
+                token,
+                signature,
             )
 
-        except Exception as exc:
+            newest_processed = signature
 
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
             print(
-                "Failed getting SOL price: "
+                "Solana transaction error "
+                f"token={token_address} "
+                f"tx={signature}: "
                 f"{exc}"
             )
 
-    # ========================================================
-    # MARKET DATA
-    # ========================================================
-
-    market_data = (
-        await get_market_data_safe(
-            chain="SOL",
-            token_address=token_address,
-        )
-    )
-
-    market_cap_usd = (
-        market_data.get(
-            "market_cap_usd"
-        )
-    )
-
-    dex_url = (
-        token["dex_url"]
-        or market_data.get(
-            "dex_url"
-        )
-    )
-
-    # ========================================================
-    # TRANSACTIONS
-    # ========================================================
-
-    for transaction_summary in (
-        transactions
-    ):
-
-        if not isinstance(
-            transaction_summary,
-            dict,
-        ):
-            continue
-
-        signature = (
-            transaction_summary.get(
-                "signature"
-            )
-            or transaction_summary.get(
-                "transactionSignature"
-            )
+    if newest_processed:
+        await save_last_signature(
+            group_id,
+            token_address,
+            newest_processed,
         )
 
-        if not signature:
-            continue
-
-        # ----------------------------------------------------
-        # DUPLICATE
-        # ----------------------------------------------------
-
-        if await event_exists(
-            group_id=group_id,
-            chain="SOL",
-            tx_hash=signature,
-            token_address=token_address,
-        ):
-            continue
-
-        # ----------------------------------------------------
-        # PARSED TRANSACTION
-        # ----------------------------------------------------
-
-        transaction = (
-            await get_transaction(
-                signature
-            )
-        )
-
-        if not transaction:
-            continue
-
-        if transaction.get(
-            "transactionError"
-        ):
-            continue
-
-        # ----------------------------------------------------
-        # EXTRACT BUY
-        # ----------------------------------------------------
-
-        buy = extract_buy(
-            transaction=transaction,
-            token_address=token_address,
-        )
-
-        if not buy:
-            continue
-
-        # ----------------------------------------------------
-        # SOL → USD
-        # ----------------------------------------------------
-
-        spent_usd = None
-
-        if (
-            buy["spent_sol"] > 0
-            and sol_price_usd is not None
-        ):
-
-            spent_usd = (
-                buy["spent_sol"]
-                * sol_price_usd
-            )
-
-        # ----------------------------------------------------
-        # MINIMUM BUY
-        # ----------------------------------------------------
-
-        if (
-            minimum_buy > 0
-            and spent_usd is not None
-            and spent_usd < minimum_buy
-        ):
-            continue
-
-        # ----------------------------------------------------
-        # SAVE EVENT
-        # ----------------------------------------------------
-
-        await save_event(
-            group_id=group_id,
-            chain="SOL",
-            tx_hash=signature,
-            token_address=token_address,
-            token_symbol=token[
-                "token_symbol"
-            ],
-            buyer_address=buy[
-                "buyer"
-            ],
-            spent_amount_usd=(
-                spent_usd
-                if spent_usd is not None
-                else Decimal("0")
-            ),
-            received_amount=buy[
-                "received_amount"
-            ],
-        )
-
-        # ----------------------------------------------------
-        # SEND ALERT
-        # ----------------------------------------------------
-
-        try:
-
-            bot = Bot(
-                token=BOT_TOKEN
-            )
-
-            try:
-
-                await send_buy_alert(
-                    bot=bot,
-                    group_id=group_id,
-                    chain="SOL",
-                    token_address=token_address,
-                    token_name=token[
-                        "token_name"
-                    ],
-                    token_symbol=token[
-                        "token_symbol"
-                    ],
-                    buyer_address=buy[
-                        "buyer"
-                    ],
-                    spent_amount_usd=spent_usd,
-                    received_amount=buy[
-                        "received_amount"
-                    ],
-                    tx_hash=signature,
-                    market_cap_usd=market_cap_usd,
-                    dex_url=dex_url,
-                    trending_url=None,
-                )
-
-            finally:
-
-                await bot.shutdown()
-
-        except Exception as exc:
-
-            print(
-                "Failed sending Solana "
-                "BuyBot alert: "
-                f"{exc}"
-            )
-
-        print(
-            "SOLANA BUY DETECTED | "
-            f"group={group_id} | "
-            f"token={token['token_symbol']} | "
-            f"spent_sol="
-            f"{buy['spent_sol']} | "
-            f"spent_usd="
-            f"{spent_usd} | "
-            f"received="
-            f"{buy['received_amount']} | "
-            f"market_cap="
-            f"{market_cap_usd} | "
-            f"buyer={buy['buyer']} | "
-            f"tx={signature}"
-        )
-
-
-# ============================================================
-# SOLANA WORKER
-# ============================================================
 
 async def solana_detector_worker():
-
     print(
-        "Solana BuyBot detector worker "
-        "started."
+        "Solana BuyBot detector started."
     )
 
-    if not HELIUS_API_KEY:
-
-        print(
-            "Solana BuyBot disabled: "
-            "HELIUS_API_KEY is missing."
-        )
-
-        while True:
-
-            await asyncio.sleep(
-                BUYBOT_POLL_SECONDS
-            )
-
     while True:
-
         try:
-
-            tokens = (
-                await get_solana_tokens()
-            )
+            tokens = await get_monitored_tokens()
 
             for token in tokens:
-
                 try:
-
                     await process_token(
                         token
                     )
 
-                except Exception as exc:
+                except asyncio.CancelledError:
+                    raise
 
+                except Exception as exc:
                     print(
                         "Solana token processing "
-                        f"error: {exc}"
+                        f"error token="
+                        f"{token.get('contract_address')}: "
+                        f"{exc}"
                     )
 
         except asyncio.CancelledError:
-
             print(
                 "Solana BuyBot detector "
-                "stopped."
+                "stopping..."
             )
-
             raise
 
         except Exception as exc:
-
             print(
-                "Solana BuyBot worker error: "
+                "Solana BuyBot detector error: "
                 f"{exc}"
             )
 
