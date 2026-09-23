@@ -4,10 +4,10 @@ import asyncio
 from decimal import Decimal
 
 import httpx
-
 from telegram import Bot
 
 from config import (
+    BOT_TOKEN,
     BNB_RPC_URL,
     ETHEREUM_RPC_URL,
     ROBINHOOD_RPC_URL,
@@ -19,6 +19,11 @@ from database.connection import get_pool
 
 from services.buybot_alert import (
     send_buy_alert,
+)
+
+from services.market_data import (
+    get_market_data_safe,
+    quote_amount_to_usd,
 )
 
 
@@ -62,12 +67,6 @@ CHAIN_CONFIG = {
 # UNISWAP V2 / PANCAKESWAP V2 SWAP EVENT
 # ============================================================
 
-# keccak256(
-#   "Swap(address,uint256,uint256,uint256,uint256,address)"
-# )
-#
-# Standard Uniswap V2 Swap event topic0.
-#
 SWAP_EVENT_TOPIC = (
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657"
     "fb8d5e3d130840159d822"
@@ -92,6 +91,7 @@ TOKEN1_SELECTOR = "0xd21220a7"
 def normalize_address(
     address: str | None,
 ) -> str | None:
+
     if not address:
         return None
 
@@ -101,6 +101,7 @@ def normalize_address(
 def topic_address(
     topic: str,
 ) -> str:
+
     value = str(topic).lower()
 
     if value.startswith("0x"):
@@ -110,13 +111,14 @@ def topic_address(
 
 
 # ============================================================
-# HEX / DECODING HELPERS
+# UINT256 DECODER
 # ============================================================
 
 def decode_uint256(
     data: str,
     index: int,
 ) -> int:
+
     if not data:
         return 0
 
@@ -143,6 +145,7 @@ def format_decimal(
     value: Decimal,
     places: int = 6,
 ) -> str:
+
     text = f"{value:.{places}f}"
 
     text = (
@@ -165,7 +168,6 @@ class EVMRPC:
         rpc_url: str,
     ):
         self.rpc_url = rpc_url
-
         self.request_id = 0
 
     async def call(
@@ -173,6 +175,7 @@ class EVMRPC:
         method: str,
         params: list,
     ):
+
         self.request_id += 1
 
         payload = {
@@ -201,11 +204,14 @@ class EVMRPC:
             result = response.json()
 
         if "error" in result:
+
             raise RuntimeError(
                 f"RPC error: {result['error']}"
             )
 
-        return result.get("result")
+        return result.get(
+            "result"
+        )
 
 
 # ============================================================
@@ -218,6 +224,7 @@ async def get_token_decimals(
 ) -> int:
 
     try:
+
         result = await rpc.call(
             "eth_call",
             [
@@ -257,6 +264,7 @@ async def get_pair_token(
 ) -> str | None:
 
     try:
+
         result = await rpc.call(
             "eth_call",
             [
@@ -300,7 +308,7 @@ async def get_latest_block(
 
 
 # ============================================================
-# FETCH SWAP LOGS
+# SWAP LOGS
 # ============================================================
 
 async def get_swap_logs(
@@ -311,6 +319,7 @@ async def get_swap_logs(
 ) -> list:
 
     try:
+
         result = await rpc.call(
             "eth_getLogs",
             [
@@ -332,6 +341,7 @@ async def get_swap_logs(
         return result or []
 
     except Exception as exc:
+
         print(
             "EVM log query failed for "
             f"{pair_address}: {exc}"
@@ -358,23 +368,11 @@ def decode_swap_log(
         "0x",
     )
 
-    # Swap event has:
-    #
-    # topic0 = event signature
-    # topic1 = sender
-    # topic2 = to
-    #
-    # amount0In
-    # amount1In
-    # amount0Out
-    # amount1Out
-    #
-    # are inside data.
-    #
     if len(topics) < 3:
         return None
 
     try:
+
         sender = topic_address(
             topics[1]
         )
@@ -430,6 +428,7 @@ def decode_swap_log(
         }
 
     except Exception as exc:
+
         print(
             "Failed to decode EVM swap: "
             f"{exc}"
@@ -439,7 +438,7 @@ def decode_swap_log(
 
 
 # ============================================================
-# DETERMINE WHETHER TOKEN WAS BOUGHT
+# DETERMINE BUY
 # ============================================================
 
 def determine_trade(
@@ -467,10 +466,6 @@ def determine_trade(
     if not token0 or not token1:
         return None
 
-    # --------------------------------------------------------
-    # TOKEN IS TOKEN0
-    # --------------------------------------------------------
-
     if token_address == token0:
 
         token_in = swap[
@@ -490,10 +485,6 @@ def determine_trade(
         ]
 
         token_side = "token0"
-
-    # --------------------------------------------------------
-    # TOKEN IS TOKEN1
-    # --------------------------------------------------------
 
     elif token_address == token1:
 
@@ -518,15 +509,11 @@ def determine_trade(
     else:
         return None
 
-    # A normal buy of the monitored token has:
-    #
-    # quote entering the pool
-    # monitored token leaving the pool
-    #
     if (
         token_out > 0
         and quote_in > 0
     ):
+
         return {
             "type": "BUY",
             "token_in": token_in,
@@ -544,6 +531,7 @@ def determine_trade(
 # ============================================================
 
 async def get_monitored_tokens():
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -590,8 +578,7 @@ async def get_last_block(
 
         row = await connection.fetchrow(
             """
-            SELECT
-                setting_value
+            SELECT setting_value
             FROM system_settings
             WHERE setting_key = $1
             """,
@@ -617,6 +604,7 @@ async def save_last_block(
     chain: str,
     block_number: int,
 ):
+
     pool = await get_pool()
 
     key = (
@@ -693,35 +681,14 @@ async def save_event(
     spent_amount_usd: Decimal,
     received_amount: Decimal,
 ):
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
 
-        try:
-            await connection.execute(
-                """
-                INSERT INTO buybot_events (
-                    group_id,
-                    chain,
-                    tx_hash,
-                    token_address,
-                    token_symbol,
-                    buyer_address,
-                    spent_amount_usd,
-                    received_amount
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    $3,
-                    $4,
-                    $5,
-                    $6,
-                    $7,
-                    $8
-                )
-                ON CONFLICT DO NOTHING
-                """,
+        await connection.execute(
+            """
+            INSERT INTO buybot_events (
                 group_id,
                 chain,
                 tx_hash,
@@ -729,14 +696,29 @@ async def save_event(
                 token_symbol,
                 buyer_address,
                 spent_amount_usd,
-                received_amount,
+                received_amount
             )
-
-        except Exception as exc:
-            print(
-                "Failed saving BuyBot event: "
-                f"{exc}"
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8
             )
+            ON CONFLICT DO NOTHING
+            """,
+            group_id,
+            chain,
+            tx_hash,
+            token_address,
+            token_symbol,
+            buyer_address,
+            spent_amount_usd,
+            received_amount,
+        )
 
 
 # ============================================================
@@ -746,6 +728,7 @@ async def save_event(
 async def get_buybot_settings(
     group_id: int,
 ):
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -763,38 +746,45 @@ async def get_buybot_settings(
 
 
 # ============================================================
-# CONVERT QUOTE AMOUNT
+# QUOTE DECIMALS
 # ============================================================
 
-async def calculate_quote_amount(
+async def get_quote_amount(
     rpc: EVMRPC,
     quote_token: str,
     raw_amount: int,
-    chain: str,
-) -> tuple[Decimal, str]:
-    """
-    Returns:
-        amount
-        quote_type
+) -> Decimal:
 
-    quote_type can be:
-        USD
-        NATIVE
-
-    Stablecoins are treated as USD.
-
-    Native/wrapped-native assets are returned as
-    native amounts for now. A later market-data
-    service will convert them to USD.
-    """
-
-    quote_token = normalize_address(
-        quote_token
+    decimals = await get_token_decimals(
+        rpc,
+        quote_token,
     )
+
+    return (
+        Decimal(raw_amount)
+        / (
+            Decimal(10)
+            ** decimals
+        )
+    )
+
+
+# ============================================================
+# QUOTE TYPE
+# ============================================================
+
+def get_quote_type(
+    chain: str,
+    quote_token: str,
+) -> str:
 
     config = CHAIN_CONFIG.get(
         chain,
         {},
+    )
+
+    normalized = normalize_address(
+        quote_token
     )
 
     stablecoins = {
@@ -813,63 +803,13 @@ async def calculate_quote_amount(
         )
     }
 
-    if quote_token in stablecoins:
+    if normalized in stablecoins:
+        return "USD"
 
-        # USDT/USDC are normally 6 decimals on
-        # the chains supported here.
-        #
-        # This will be improved later by reading
-        # the actual token decimals.
-        decimals = await get_token_decimals(
-            rpc,
-            quote_token,
-        )
+    if normalized in wrapped_native:
+        return "NATIVE"
 
-        amount = (
-            Decimal(raw_amount)
-            / (
-                Decimal(10)
-                ** decimals
-            )
-        )
-
-        return amount, "USD"
-
-    if quote_token in wrapped_native:
-
-        decimals = await get_token_decimals(
-            rpc,
-            quote_token,
-        )
-
-        amount = (
-            Decimal(raw_amount)
-            / (
-                Decimal(10)
-                ** decimals
-            )
-        )
-
-        return amount, "NATIVE"
-
-    # Unknown quote token.
-    #
-    # We still decode its actual amount but do
-    # not pretend that the amount is USD.
-    decimals = await get_token_decimals(
-        rpc,
-        quote_token,
-    )
-
-    amount = (
-        Decimal(raw_amount)
-        / (
-            Decimal(10)
-            ** decimals
-        )
-    )
-
-    return amount, "UNKNOWN"
+    return "UNKNOWN"
 
 
 # ============================================================
@@ -883,6 +823,7 @@ async def process_swap(
     swap: dict,
     pair_cache: dict,
 ):
+
     token_address = normalize_address(
         token["contract_address"]
     )
@@ -898,7 +839,7 @@ async def process_swap(
         return
 
     # --------------------------------------------------------
-    # Get pair tokens
+    # PAIR TOKENS
     # --------------------------------------------------------
 
     if pair_address not in pair_cache:
@@ -930,7 +871,7 @@ async def process_swap(
         return
 
     # --------------------------------------------------------
-    # Determine BUY
+    # BUY
     # --------------------------------------------------------
 
     trade = determine_trade(
@@ -955,7 +896,7 @@ async def process_swap(
     )
 
     # --------------------------------------------------------
-    # Duplicate protection
+    # DUPLICATE
     # --------------------------------------------------------
 
     if await event_exists(
@@ -967,12 +908,14 @@ async def process_swap(
         return
 
     # --------------------------------------------------------
-    # Token amount
+    # TOKEN AMOUNT
     # --------------------------------------------------------
 
-    decimals = await get_token_decimals(
-        rpc,
-        token_address,
+    token_decimals = (
+        await get_token_decimals(
+            rpc,
+            token_address,
+        )
     )
 
     received_amount = (
@@ -981,12 +924,12 @@ async def process_swap(
         )
         / (
             Decimal(10)
-            ** decimals
+            ** token_decimals
         )
     )
 
     # --------------------------------------------------------
-    # Quote token
+    # QUOTE TOKEN
     # --------------------------------------------------------
 
     if token0 == token_address:
@@ -994,23 +937,65 @@ async def process_swap(
     else:
         quote_token = token0
 
-    quote_amount, quote_type = (
-        await calculate_quote_amount(
+    quote_amount = (
+        await get_quote_amount(
             rpc=rpc,
             quote_token=quote_token,
             raw_amount=trade[
                 "quote_in"
             ],
+        )
+    )
+
+    quote_type = get_quote_type(
+        chain=chain,
+        quote_token=quote_token,
+    )
+
+    # --------------------------------------------------------
+    # CONVERT QUOTE TO USD
+    # --------------------------------------------------------
+
+    spent_usd = (
+        await quote_amount_to_usd(
             chain=chain,
+            quote_type=quote_type,
+            amount=quote_amount,
         )
     )
 
     # --------------------------------------------------------
-    # Settings
+    # MARKET DATA
     # --------------------------------------------------------
 
-    settings = await get_buybot_settings(
-        group_id
+    market_data = (
+        await get_market_data_safe(
+            chain=chain,
+            token_address=token_address,
+        )
+    )
+
+    market_cap_usd = (
+        market_data.get(
+            "market_cap_usd"
+        )
+    )
+
+    dex_url = (
+        token["dex_url"]
+        or market_data.get(
+            "dex_url"
+        )
+    )
+
+    # --------------------------------------------------------
+    # SETTINGS
+    # --------------------------------------------------------
+
+    settings = (
+        await get_buybot_settings(
+            group_id
+        )
     )
 
     if not settings:
@@ -1021,47 +1006,34 @@ async def process_swap(
 
     minimum_buy = Decimal(
         str(
-            settings["min_buy_usd"]
+            settings[
+                "min_buy_usd"
+            ]
             or 0
         )
     )
 
     # --------------------------------------------------------
-    # Minimum filter
+    # MINIMUM BUY FILTER
     # --------------------------------------------------------
-    #
-    # Only apply USD minimum when we actually
-    # have a USD-denominated quote.
-    #
-    # Native assets are NOT falsely treated as USD.
-    #
 
     if (
         minimum_buy > 0
-        and quote_type == "USD"
-        and quote_amount < minimum_buy
+        and spent_usd is not None
+        and spent_usd < minimum_buy
     ):
         return
 
-    # --------------------------------------------------------
-    # Store event
-    # --------------------------------------------------------
+    # If USD price isn't available yet, we don't
+    # reject the buy. This prevents the detector
+    # from silently losing real transactions.
+    #
+    # Once the market-price layer returns a value,
+    # the configured minimum is enforced.
 
-    #
-    # Database column is named spent_amount_usd.
-    #
-    # For stablecoin pairs this is genuinely USD-like.
-    #
-    # For native/unknown pairs we currently store the
-    # decoded quote amount so the event is preserved.
-    #
-    # The market-data layer will later replace this
-    # with a proper USD conversion.
-    #
-
-    spent_amount_for_storage = (
-        quote_amount
-    )
+    # --------------------------------------------------------
+    # SAVE EVENT
+    # --------------------------------------------------------
 
     await save_event(
         group_id=group_id,
@@ -1075,7 +1047,9 @@ async def process_swap(
             "buyer"
         ),
         spent_amount_usd=(
-            spent_amount_for_storage
+            spent_usd
+            if spent_usd is not None
+            else Decimal("0")
         ),
         received_amount=(
             received_amount
@@ -1083,15 +1057,13 @@ async def process_swap(
     )
 
     # --------------------------------------------------------
-    # Send shared BuyBot alert
+    # SEND ALERT
     # --------------------------------------------------------
 
     try:
 
         bot = Bot(
-            token=__import__(
-                "config"
-            ).BOT_TOKEN
+            token=BOT_TOKEN
         )
 
         try:
@@ -1110,23 +1082,16 @@ async def process_swap(
                 buyer_address=swap.get(
                     "buyer"
                 ),
-                spent_amount_usd=(
-                    quote_amount
-                    if quote_type == "USD"
-                    else None
-                ),
-                received_amount=(
-                    received_amount
-                ),
+                spent_amount_usd=spent_usd,
+                received_amount=received_amount,
                 tx_hash=tx_hash,
-                market_cap_usd=None,
-                dex_url=token[
-                    "dex_url"
-                ],
+                market_cap_usd=market_cap_usd,
+                dex_url=dex_url,
                 trending_url=None,
             )
 
         finally:
+
             await bot.shutdown()
 
     except Exception as exc:
@@ -1144,8 +1109,10 @@ async def process_swap(
         f"token={token['token_symbol']} | "
         f"quote={format_decimal(quote_amount)} "
         f"{quote_type} | "
+        f"spent_usd={spent_usd} | "
         f"received="
         f"{format_decimal(received_amount)} | "
+        f"market_cap={market_cap_usd} | "
         f"buyer={swap.get('buyer')} | "
         f"tx={tx_hash}"
     )
@@ -1158,6 +1125,7 @@ async def process_swap(
 async def process_chain(
     chain: str,
 ):
+
     config = CHAIN_CONFIG.get(
         chain
     )
@@ -1170,9 +1138,11 @@ async def process_chain(
     )
 
     if not rpc_url:
+
         print(
             f"No RPC configured for {chain}."
         )
+
         return
 
     rpc = EVMRPC(
@@ -1206,9 +1176,6 @@ async def process_chain(
 
     if last_block is None:
 
-        # Start close to the current chain tip
-        # on first activation instead of scanning
-        # an enormous historical range.
         last_block = max(
             0,
             latest_block - 2,
@@ -1238,7 +1205,7 @@ async def process_chain(
     pair_cache = {}
 
     # --------------------------------------------------------
-    # Cache pair token addresses
+    # PAIR CACHE
     # --------------------------------------------------------
 
     for token in chain_tokens:
@@ -1277,7 +1244,7 @@ async def process_chain(
         )
 
     # --------------------------------------------------------
-    # Scan each monitored pair
+    # SCAN LOGS
     # --------------------------------------------------------
 
     for token in chain_tokens:
@@ -1331,7 +1298,7 @@ async def process_chain(
                 )
 
     # --------------------------------------------------------
-    # Save progress
+    # SAVE PROGRESS
     # --------------------------------------------------------
 
     await save_last_block(
@@ -1347,6 +1314,7 @@ async def process_chain(
 async def evm_chain_loop(
     chain: str,
 ):
+
     print(
         f"{chain} BuyBot detector "
         "started."
