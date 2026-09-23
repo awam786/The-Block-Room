@@ -1,23 +1,53 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
+from services.dex import get_best_token_pair
+from services.orders import (
+    get_order,
+    mark_order_active,
+    mark_order_expired,
+    mark_order_waiting_for_launch,
+)
 from database.connection import get_pool
 
-from services.dex import (
-    get_token_pairs,
-    choose_best_pair,
-    parse_pair,
-)
+
+POLL_SECONDS = 30
 
 
-CHECK_INTERVAL_SECONDS = 30
+SUPPORTED_CHAINS = {
+    "bnb",
+    "ethereum",
+    "solana",
+    "robinhood",
+}
 
 
-# ============================================================
-# GET PAID ORDERS READY FOR ACTIVATION
-# ============================================================
+def normalize_chain(
+    chain: str,
+) -> str:
+    value = (
+        str(chain)
+        .strip()
+        .lower()
+    )
 
-async def get_paid_orders():
+    aliases = {
+        "bsc": "bnb",
+        "binance": "bnb",
+        "binance-smart-chain": "bnb",
+        "eth": "ethereum",
+        "sol": "solana",
+        "rh": "robinhood",
+        "robinhood-chain": "robinhood",
+    }
+
+    return aliases.get(
+        value,
+        value,
+    )
+
+
+async def get_paid_orders() -> List[Dict[str, Any]]:
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -33,430 +63,336 @@ async def get_paid_orders():
                 o.token_symbol,
                 o.duration_hours,
                 o.amount,
-                o.payment_wallet,
                 o.status,
                 o.created_at,
-                o.updated_at
+                o.paid_at,
+                o.activated_at,
+                o.expires_at,
+                t.id AS trend_id,
+                t.status AS trend_status,
+                t.activated_at AS trend_activated_at,
+                t.expires_at AS trend_expires_at
             FROM orders o
             LEFT JOIN trends t
                 ON t.order_id = o.id
-            WHERE o.status = 'PAID'
-              AND t.id IS NULL
-            ORDER BY o.updated_at ASC
-            LIMIT 50;
+            WHERE o.status IN (
+                'PAID',
+                'PAID_WAITING_FOR_LAUNCH',
+                'ACTIVE'
+            )
+            ORDER BY o.created_at ASC;
             """
         )
 
-        return rows
+        return [
+            dict(row)
+            for row in rows
+        ]
 
 
-# ============================================================
-# GET WAITING-FOR-LAUNCH ORDERS
-# ============================================================
-
-async def get_waiting_orders():
+async def get_waiting_orders() -> List[Dict[str, Any]]:
     pool = await get_pool()
 
     async with pool.acquire() as connection:
         rows = await connection.fetch(
             """
             SELECT
-                o.id,
-                o.order_id,
-                o.user_id,
-                o.chain,
-                o.token_address,
-                o.token_name,
-                o.token_symbol,
-                o.duration_hours,
-                o.amount,
-                o.payment_wallet,
-                o.status,
-                o.created_at,
-                o.updated_at
-            FROM orders o
-            WHERE o.status = 'PAID_WAITING_FOR_LAUNCH'
-            ORDER BY o.updated_at ASC
-            LIMIT 50;
+                id,
+                order_id,
+                user_id,
+                chain,
+                token_address,
+                token_name,
+                token_symbol,
+                duration_hours,
+                amount,
+                status,
+                created_at,
+                paid_at,
+                activated_at,
+                expires_at
+            FROM orders
+            WHERE status = 'PAID_WAITING_FOR_LAUNCH'
+            ORDER BY created_at ASC
+            LIMIT 200;
             """
         )
 
-        return rows
+        return [
+            dict(row)
+            for row in rows
+        ]
 
-
-# ============================================================
-# FIND LIVE TOKEN PAIR
-# ============================================================
 
 async def find_live_pair(
     chain: str,
     token_address: str,
-):
-    normalized_chain = (
+) -> Optional[Dict[str, Any]]:
+    chain = normalize_chain(
         chain
-        or ""
-    ).lower().strip()
+    )
 
-    if normalized_chain not in {
-        "bnb",
-        "ethereum",
-        "solana",
-    }:
+    if chain not in SUPPORTED_CHAINS:
         return None
 
     if not token_address:
         return None
 
     try:
-        pairs = await get_token_pairs(
-            normalized_chain,
+        return await get_best_token_pair(
+            chain,
             token_address,
-        )
-
-        if not pairs:
-            return None
-
-        pair = choose_best_pair(
-            pairs
-        )
-
-        if not pair:
-            return None
-
-        return parse_pair(
-            pair
         )
 
     except Exception as exc:
         print(
-            "DEX pair check failed "
-            f"for {normalized_chain} "
-            f"{token_address}: {exc}"
+            "Live pair lookup error "
+            f"chain={chain} "
+            f"token={token_address}: "
+            f"{exc}"
         )
-
         return None
 
 
-# ============================================================
-# ACTIVATE TREND
-# ============================================================
-
 async def activate_order(
-    order,
-    market_data: dict,
+    order: Dict[str, Any],
+    pair: Dict[str, Any],
 ):
-    pool = await get_pool()
-
-    now = datetime.now(
-        timezone.utc
-    )
-
-    duration_hours = int(
-        order["duration_hours"]
-    )
-
-    expires_at = (
-        now
-        + timedelta(
-            hours=duration_hours
-        )
-    )
+    order_id = order["order_id"]
 
     token_name = (
-        market_data.get("name")
-        or order["token_name"]
+        pair.get("name")
+        or order.get("token_name")
         or "Unknown"
     )
 
     token_symbol = (
-        market_data.get("symbol")
-        or order["token_symbol"]
+        pair.get("symbol")
+        or order.get("token_symbol")
         or "UNKNOWN"
     )
 
-    token_address = (
-        market_data.get("address")
-        or order["token_address"]
-    )
+    try:
+        changed = await mark_order_active(
+            order_id=order_id,
+            token_name=token_name,
+            token_symbol=token_symbol,
+        )
 
-    async with pool.acquire() as connection:
-        async with connection.transaction():
+    except TypeError:
+        # Compatibility with the existing orders
+        # service if it only accepts order_id.
+        changed = await mark_order_active(
+            order_id
+        )
 
-            # -------------------------------------------------
-            # LOCK ORDER
-            # Prevent two workers from activating it twice.
-            # -------------------------------------------------
-
-            current_order = await connection.fetchrow(
-                """
-                SELECT
-                    id,
-                    order_id,
-                    status,
-                    chain,
-                    token_address,
-                    token_name,
-                    token_symbol,
-                    duration_hours
-                FROM orders
-                WHERE id = $1
-                FOR UPDATE;
-                """,
-                order["id"],
-            )
-
-            if not current_order:
-                return False
-
-            if current_order["status"] not in {
-                "PAID",
-                "PAID_WAITING_FOR_LAUNCH",
-            }:
-                return False
-
-            # -------------------------------------------------
-            # CHECK WHETHER A TREND ALREADY EXISTS
-            # -------------------------------------------------
-
-            existing_trend = await connection.fetchval(
-                """
-                SELECT id
-                FROM trends
-                WHERE order_id = $1
-                LIMIT 1;
-                """,
-                order["id"],
-            )
-
-            if existing_trend:
-                return False
-
-            # -------------------------------------------------
-            # CREATE ACTIVE TREND
-            # -------------------------------------------------
-
-            await connection.execute(
-                """
-                INSERT INTO trends (
-                    order_id,
-                    chain,
-                    contract_address,
-                    token_name,
-                    token_symbol,
-                    status,
-                    score,
-                    volume_24h,
-                    market_cap,
-                    liquidity,
-                    price_change_24h,
-                    started_at,
-                    expires_at,
-                    updated_at
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    $3,
-                    $4,
-                    $5,
-                    'ACTIVE',
-                    0,
-                    $6,
-                    $7,
-                    $8,
-                    $9,
-                    $10,
-                    $11,
-                    NOW()
-                );
-                """,
-                order["id"],
-                order["chain"],
-                token_address,
-                token_name,
-                token_symbol,
-                market_data.get(
-                    "volume_24h"
-                ) or 0,
-                market_data.get(
-                    "market_cap"
-                ) or 0,
-                market_data.get(
-                    "liquidity_usd"
-                ) or 0,
-                market_data.get(
-                    "price_change_24h"
-                ) or 0,
-                now,
-                expires_at,
-            )
-
-            # -------------------------------------------------
-            # MARK ORDER ACTIVE
-            # -------------------------------------------------
-
-            await connection.execute(
-                """
-                UPDATE orders
-                SET
-                    status = 'ACTIVE',
-                    activated_at = COALESCE(
-                        activated_at,
-                        $1
-                    ),
-                    expires_at = $2,
-                    token_name = COALESCE(
-                        $3,
-                        token_name
-                    ),
-                    token_symbol = COALESCE(
-                        $4,
-                        token_symbol
-                    ),
-                    updated_at = NOW()
-                WHERE id = $5
-                  AND status IN (
-                      'PAID',
-                      'PAID_WAITING_FOR_LAUNCH'
-                  );
-                """,
-                now,
-                expires_at,
-                token_name,
-                token_symbol,
-                order["id"],
-            )
+    if not changed:
+        print(
+            "Order was not activated "
+            f"order={order_id}"
+        )
+        return False
 
     print(
-        "Order "
-        f"{order['order_id']} activated."
+        "Trend activated "
+        f"order={order_id} "
+        f"token={token_symbol}"
     )
 
     return True
 
 
-# ============================================================
-# PROCESS PAID ORDER
-# ============================================================
-
-async def process_paid_order(
-    order,
+async def refresh_waiting_order(
+    order: Dict[str, Any],
 ):
-    market_data = await find_live_pair(
-        order["chain"],
+    order_id = order["order_id"]
+
+    chain = normalize_chain(
+        order["chain"]
+    )
+
+    token_address = (
+        order["token_address"]
+    )
+
+    if chain not in SUPPORTED_CHAINS:
+        print(
+            "Unsupported waiting-order chain "
+            f"order={order_id} "
+            f"chain={chain}"
+        )
+        return
+
+    pair = await find_live_pair(
+        chain,
+        token_address,
+    )
+
+    if not pair:
+        return
+
+    print(
+        "Live pair detected "
+        f"order={order_id} "
+        f"chain={chain} "
+        f"token={token_address}"
+    )
+
+    await activate_order(
+        order,
+        pair,
+    )
+
+
+async def ensure_paid_order_state(
+    order: Dict[str, Any],
+):
+    """
+    Makes sure a paid order that does not have
+    a live market pair remains in the correct
+    pre-launch state.
+    """
+
+    order_id = order["order_id"]
+
+    if order["status"] != "PAID":
+        return
+
+    chain = normalize_chain(
+        order["chain"]
+    )
+
+    pair = await find_live_pair(
+        chain,
         order["token_address"],
     )
 
-    # ---------------------------------------------------------
-    # NO LIVE PAIR YET
-    #
-    # Keep the order paid until the token launches.
-    # ---------------------------------------------------------
+    if pair:
+        await activate_order(
+            order,
+            pair,
+        )
+        return
 
-    if not market_data:
-        await move_to_waiting_for_launch(
-            order["id"]
+    try:
+        await mark_order_waiting_for_launch(
+            order_id
         )
 
-        return
-
-    await activate_order(
-        order,
-        market_data,
-    )
-
-
-# ============================================================
-# PROCESS PRE-LAUNCH ORDER
-# ============================================================
-
-async def process_waiting_order(
-    order,
-):
-    market_data = await find_live_pair(
-        order["chain"],
-        order["token_address"],
-    )
-
-    if not market_data:
-        return
-
-    await activate_order(
-        order,
-        market_data,
-    )
+    except Exception as exc:
+        print(
+            "Could not move order to "
+            "waiting-for-launch "
+            f"order={order_id}: {exc}"
+        )
 
 
-# ============================================================
-# MOVE PAID ORDER TO WAITING FOR LAUNCH
-# ============================================================
+async def expire_old_active_orders():
+    """
+    The orders service is responsible for calculating
+    and applying expiry. This worker only asks it to
+    process orders whose expiry timestamp has passed.
+    """
 
-async def move_to_waiting_for_launch(
-    order_id: int,
-):
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-        result = await connection.execute(
+        rows = await connection.fetch(
             """
-            UPDATE orders
-            SET
-                status = 'PAID_WAITING_FOR_LAUNCH',
-                updated_at = NOW()
-            WHERE id = $1
-              AND status = 'PAID';
-            """,
-            order_id,
+            SELECT
+                id,
+                order_id,
+                status
+            FROM orders
+            WHERE status = 'ACTIVE'
+              AND expires_at IS NOT NULL
+              AND expires_at <= NOW()
+            ORDER BY expires_at ASC
+            LIMIT 200;
+            """
         )
 
-        return result == "UPDATE 1"
+    for row in rows:
+        order_id = row["order_id"]
 
-
-# ============================================================
-# EXPIRE ACTIVE TRENDS
-# ============================================================
-
-async def expire_finished_trends():
-    pool = await get_pool()
-
-    async with pool.acquire() as connection:
-        async with connection.transaction():
-
-            rows = await connection.fetch(
-                """
-                UPDATE trends
-                SET
-                    status = 'EXPIRED',
-                    updated_at = NOW()
-                WHERE status = 'ACTIVE'
-                  AND expires_at IS NOT NULL
-                  AND expires_at <= NOW()
-                RETURNING order_id;
-                """
+        try:
+            changed = await mark_order_expired(
+                order_id
             )
 
-            for row in rows:
-                await connection.execute(
-                    """
-                    UPDATE orders
-                    SET
-                        status = 'EXPIRED',
-                        updated_at = NOW()
-                    WHERE id = $1
-                      AND status = 'ACTIVE';
-                    """,
-                    row["order_id"],
+            if changed:
+                print(
+                    "Order expired "
+                    f"order={order_id}"
                 )
 
-    if rows:
+        except Exception as exc:
+            print(
+                "Order expiry error "
+                f"order={order_id}: {exc}"
+            )
+
+
+async def process_waiting_orders():
+    orders = await get_waiting_orders()
+
+    if not orders:
+        return
+
+    for order in orders:
+        try:
+            await refresh_waiting_order(
+                order
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            print(
+                "Waiting order processing error "
+                f"order={order['order_id']}: "
+                f"{exc}"
+            )
+
+
+async def process_paid_orders():
+    orders = await get_paid_orders()
+
+    if not orders:
+        return
+
+    for order in orders:
+        try:
+            if order["status"] == "PAID":
+                await ensure_paid_order_state(
+                    order
+                )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            print(
+                "Paid order processing error "
+                f"order={order['order_id']}: "
+                f"{exc}"
+            )
+
+
+async def process_expired_orders():
+    try:
+        await expire_old_active_orders()
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
         print(
-            f"Expired {len(rows)} trend(s)."
+            "Expired order processing error: "
+            f"{exc}"
         )
 
-
-# ============================================================
-# MAIN ACTIVATION WORKER
-# ============================================================
 
 async def trend_activation_worker():
     print(
@@ -465,55 +401,17 @@ async def trend_activation_worker():
 
     while True:
         try:
-            # -------------------------------------------------
-            # CHECK PAID ORDERS
-            # -------------------------------------------------
+            await process_paid_orders()
 
-            paid_orders = await get_paid_orders()
+            await process_waiting_orders()
 
-            for order in paid_orders:
-                try:
-                    await process_paid_order(
-                        order
-                    )
-
-                except Exception as exc:
-                    print(
-                        "Paid order processing "
-                        f"error order="
-                        f"{order['order_id']}: "
-                        f"{exc}"
-                    )
-
-            # -------------------------------------------------
-            # CHECK PRE-LAUNCH ORDERS
-            # -------------------------------------------------
-
-            waiting_orders = (
-                await get_waiting_orders()
-            )
-
-            for order in waiting_orders:
-                try:
-                    await process_waiting_order(
-                        order
-                    )
-
-                except Exception as exc:
-                    print(
-                        "Waiting order processing "
-                        f"error order="
-                        f"{order['order_id']}: "
-                        f"{exc}"
-                    )
-
-            # -------------------------------------------------
-            # EXPIRE FINISHED TRENDS
-            # -------------------------------------------------
-
-            await expire_finished_trends()
+            await process_expired_orders()
 
         except asyncio.CancelledError:
+            print(
+                "Trend activation worker "
+                "stopping..."
+            )
             raise
 
         except Exception as exc:
@@ -523,5 +421,5 @@ async def trend_activation_worker():
             )
 
         await asyncio.sleep(
-            CHECK_INTERVAL_SECONDS
+            POLL_SECONDS
         )
