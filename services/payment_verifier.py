@@ -51,6 +51,15 @@ def decimal_value(
         return default
 
 
+def normalize_address(
+    address: str,
+):
+    return (
+        address
+        or ""
+    ).strip().lower()
+
+
 async def get_payment_tolerance():
     pool = await get_pool()
 
@@ -160,15 +169,25 @@ def get_evm_config(
         or ""
     ).lower().strip()
 
-    if normalized == "ethereum":
+    if normalized in {
+        "ethereum",
+        "eth",
+    }:
         return {
+            "chain": "ethereum",
             "chain_id": 1,
             "rpc_url": ETHEREUM_RPC_URL,
             "usdt": ETH_USDT_CONTRACT,
         }
 
-    if normalized == "bnb":
+    if normalized in {
+        "bnb",
+        "bsc",
+        "binance",
+        "binance smart chain",
+    }:
         return {
+            "chain": "bnb",
             "chain_id": 56,
             "rpc_url": BNB_RPC_URL,
             "usdt": BNB_USDT_CONTRACT,
@@ -181,6 +200,14 @@ async def etherscan_request(
     chain_id: int,
     params: dict,
 ):
+    if not ETHERSCAN_API_KEY:
+        return {
+            "temporary_error": True,
+            "error": (
+                "Etherscan API key is not configured."
+            ),
+        }
+
     request_params = {
         "chainid": chain_id,
         "apikey": ETHERSCAN_API_KEY,
@@ -198,15 +225,29 @@ async def etherscan_request(
 
             response.raise_for_status()
 
-            return response.json()
+            data = response.json()
 
     except (
         httpx.HTTPError,
         ValueError,
     ) as exc:
         return {
-            "error": str(exc)
+            "temporary_error": True,
+            "error": str(exc),
         }
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return {
+            "temporary_error": True,
+            "error": (
+                "Invalid explorer response."
+            ),
+        }
+
+    return data
 
 
 async def rpc_call(
@@ -253,15 +294,6 @@ async def rpc_call(
     return data.get("result")
 
 
-def normalize_address(
-    address: str,
-):
-    return (
-        address
-        or ""
-    ).strip().lower()
-
-
 async def verify_evm_transfer(
     chain: str,
     tx_hash: str,
@@ -297,8 +329,22 @@ async def verify_evm_transfer(
         expected_wallet
     )
 
+    normalized_tx_hash = (
+        tx_hash
+        or ""
+    ).strip().lower()
+
+    if not normalized_tx_hash:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Transaction hash is required."
+            ),
+        }
+
     # ---------------------------------------------------------
-    # GET TOKEN TRANSFERS
+    # GET EXACT USDT TRANSFER
     # ---------------------------------------------------------
 
     data = await etherscan_request(
@@ -316,7 +362,9 @@ async def verify_evm_transfer(
         },
     )
 
-    if "error" in data:
+    if data.get(
+        "temporary_error"
+    ):
         return {
             "valid": False,
             "pending": True,
@@ -335,6 +383,33 @@ async def verify_evm_transfer(
         transfers,
         list,
     ):
+        message = (
+            data.get(
+                "message"
+            )
+            or data.get(
+                "result"
+            )
+            or ""
+        )
+
+        message_lower = str(
+            message
+        ).lower()
+
+        if (
+            "no transactions" in message_lower
+            or "no records" in message_lower
+        ):
+            return {
+                "valid": False,
+                "pending": False,
+                "reason": (
+                    "No matching USDT transfer was "
+                    "found for this transaction."
+                ),
+            }
+
         return {
             "valid": False,
             "pending": True,
@@ -352,9 +427,9 @@ async def verify_evm_transfer(
                 "hash"
             )
             or ""
-        ).lower()
+        ).strip().lower()
 
-        if transfer_hash != tx_hash.lower():
+        if transfer_hash != normalized_tx_hash:
             continue
 
         contract = normalize_address(
@@ -391,7 +466,7 @@ async def verify_evm_transfer(
         }
 
     # ---------------------------------------------------------
-    # CHECK TRANSACTION RECEIPT
+    # CHECK TRANSACTION SUCCESS
     # ---------------------------------------------------------
 
     try:
@@ -422,27 +497,67 @@ async def verify_evm_transfer(
             ),
         }
 
-    receipt_status = receipt.get(
-        "status"
+    receipt_status = (
+        receipt.get(
+            "status"
+        )
     )
 
-    if receipt_status != "0x1":
-        if receipt_status == "0x0":
-            return {
-                "valid": False,
-                "pending": False,
-                "reason": (
-                    "The blockchain transaction "
-                    "failed."
-                ),
-            }
+    if receipt_status == "0x0":
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "The blockchain transaction failed."
+            ),
+        }
 
+    if receipt_status != "0x1":
         return {
             "valid": False,
             "pending": True,
             "reason": (
                 "Transaction status is still "
                 "being confirmed."
+            ),
+        }
+
+    # ---------------------------------------------------------
+    # CHECK TRANSACTION BLOCK
+    # ---------------------------------------------------------
+
+    try:
+        receipt_block_hex = (
+            receipt.get(
+                "blockNumber"
+            )
+        )
+
+        if not receipt_block_hex:
+            return {
+                "valid": False,
+                "pending": True,
+                "reason": (
+                    "Transaction block information "
+                    "is not available yet."
+                ),
+            }
+
+        transaction_block = int(
+            receipt_block_hex,
+            16,
+        )
+
+    except (
+        ValueError,
+        TypeError,
+    ):
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                "Unable to determine the "
+                "transaction block yet."
             ),
         }
 
@@ -459,16 +574,14 @@ async def verify_evm_transfer(
             )
         )
 
+        if not current_block_hex:
+            raise ValueError(
+                "Current block unavailable."
+            )
+
         current_block = int(
             current_block_hex,
             16,
-        )
-
-        transaction_block = int(
-            matching_transfer.get(
-                "blockNumber",
-                "0",
-            )
         )
 
     except (
@@ -503,7 +616,7 @@ async def verify_evm_transfer(
         }
 
     # ---------------------------------------------------------
-    # CHECK AMOUNT
+    # CHECK EXACT USDT AMOUNT
     # ---------------------------------------------------------
 
     raw_value = decimal_value(
@@ -512,12 +625,28 @@ async def verify_evm_transfer(
         )
     )
 
-    decimals = int(
-        matching_transfer.get(
-            "tokenDecimal",
-            6,
+    try:
+        decimals = int(
+            matching_transfer.get(
+                "tokenDecimal",
+                6,
+            )
         )
-    )
+    except (
+        ValueError,
+        TypeError,
+    ):
+        decimals = 6
+
+    if decimals < 0 or decimals > 36:
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                "Invalid token decimal information "
+                "was returned by the explorer."
+            ),
+        }
 
     actual_amount = (
         raw_value
@@ -536,6 +665,9 @@ async def verify_evm_transfer(
         - tolerance
     )
 
+    if minimum_amount < 0:
+        minimum_amount = Decimal("0")
+
     if actual_amount < minimum_amount:
         return {
             "valid": False,
@@ -543,7 +675,7 @@ async def verify_evm_transfer(
             "reason": (
                 f"Received {actual_amount} USDT, "
                 f"but {expected_amount} USDT "
-                f"is required."
+                "is required."
             ),
         }
 
@@ -568,6 +700,21 @@ async def verify_solana_transfer(
             "reason": (
                 "Solana payment verification "
                 "is temporarily unavailable."
+            ),
+        }
+
+    expected_wallet = (
+        expected_wallet
+        or ""
+    ).strip()
+
+    if not expected_wallet:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Solana payment wallet is not "
+                "configured."
             ),
         }
 
@@ -651,10 +798,9 @@ async def verify_solana_transfer(
             ),
         }
 
-    expected_wallet = (
-        expected_wallet
-        or ""
-    ).strip()
+    # ---------------------------------------------------------
+    # CHECK TOKEN BALANCE INCREASE
+    # ---------------------------------------------------------
 
     post_balances = (
         meta.get(
@@ -673,13 +819,23 @@ async def verify_solana_transfer(
     pre_map = {}
 
     for balance in pre_balances:
-        key = (
-            balance.get(
-                "accountIndex"
-            ),
+        mint = (
             balance.get(
                 "mint"
-            ),
+            )
+            or ""
+        )
+
+        if mint != SOLANA_USDT_MINT:
+            continue
+
+        account_index = balance.get(
+            "accountIndex"
+        )
+
+        key = (
+            account_index,
+            mint,
         )
 
         pre_map[key] = decimal_value(
@@ -716,10 +872,12 @@ async def verify_solana_transfer(
         if owner != expected_wallet:
             continue
 
+        account_index = balance.get(
+            "accountIndex"
+        )
+
         key = (
-            balance.get(
-                "accountIndex"
-            ),
+            account_index,
             mint,
         )
 
@@ -758,6 +916,9 @@ async def verify_solana_transfer(
         - tolerance
     )
 
+    if minimum_amount < 0:
+        minimum_amount = Decimal("0")
+
     if matching_received < minimum_amount:
         return {
             "valid": False,
@@ -789,6 +950,11 @@ async def verify_payment(
                 "Invalid order ID."
             ),
         }
+
+    tx_hash = (
+        tx_hash
+        or ""
+    ).strip()
 
     if not tx_hash:
         return {
@@ -824,6 +990,10 @@ async def verify_payment(
                 "awaiting payment verification."
             ),
         }
+
+    # ---------------------------------------------------------
+    # DUPLICATE TRANSACTION PROTECTION
+    # ---------------------------------------------------------
 
     already_used = (
         await transaction_already_used(
@@ -861,6 +1031,15 @@ async def verify_payment(
         order["amount"]
     )
 
+    if expected_amount <= 0:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Invalid order payment amount."
+            ),
+        }
+
     payment_wallet = (
         order["payment_wallet"]
         or ""
@@ -878,7 +1057,9 @@ async def verify_payment(
 
     if chain in {
         "ethereum",
+        "eth",
         "bnb",
+        "bsc",
     }:
         result = await verify_evm_transfer(
             chain=chain,
@@ -904,9 +1085,7 @@ async def verify_payment(
             ),
         }
 
-    if result.get(
-        "valid"
-    ):
+    if result.get("valid"):
         await save_used_transaction(
             tx_hash=tx_hash,
             order_id=order_id,
