@@ -11,6 +11,29 @@ PAYMENT_CHAINS = {
 }
 
 
+def normalize_chain(
+    chain: str,
+) -> str:
+    normalized = (
+        chain
+        or ""
+    ).lower().strip()
+
+    aliases = {
+        "bsc": "bnb",
+        "binance": "bnb",
+        "binance smart chain": "bnb",
+        "eth": "ethereum",
+        "ethereum mainnet": "ethereum",
+        "sol": "solana",
+    }
+
+    return aliases.get(
+        normalized,
+        normalized,
+    )
+
+
 async def create_order(
     user_id: int,
     chain: str,
@@ -20,14 +43,23 @@ async def create_order(
     duration_hours: int,
     amount: Decimal,
 ):
-    chain = (
+    chain = normalize_chain(
         chain
-        or ""
-    ).lower().strip()
+    )
 
     if chain not in PAYMENT_CHAINS:
         raise ValueError(
             "Unsupported payment chain."
+        )
+
+    if amount <= 0:
+        raise ValueError(
+            "Order amount must be greater than zero."
+        )
+
+    if duration_hours <= 0:
+        raise ValueError(
+            "Duration must be greater than zero."
         )
 
     pool = await get_pool()
@@ -175,7 +207,7 @@ async def get_order(
             WHERE order_id = $1
             LIMIT 1;
             """,
-            order_id,
+            order_id.strip(),
         )
 
 
@@ -215,7 +247,7 @@ async def get_order_for_user(
               AND user_id = $2
             LIMIT 1;
             """,
-            order_id,
+            order_id.strip(),
             user_id,
         )
 
@@ -231,6 +263,9 @@ async def submit_transaction_hash(
         return False
 
     tx_hash = tx_hash.strip()
+
+    if not tx_hash:
+        return False
 
     pool = await get_pool()
 
@@ -250,7 +285,7 @@ async def submit_transaction_hash(
               );
             """,
             tx_hash,
-            order_id,
+            order_id.strip(),
         )
 
         return result == "UPDATE 1"
@@ -282,7 +317,7 @@ async def mark_order_paid(
                   'PAYMENT_SUBMITTED'
               );
             """,
-            order_id,
+            order_id.strip(),
         )
 
         return result == "UPDATE 1"
@@ -294,6 +329,11 @@ async def mark_order_failed(
 ):
     if not order_id:
         return False
+
+    reason = (
+        reason
+        or "Payment verification failed."
+    )
 
     pool = await get_pool()
 
@@ -312,7 +352,7 @@ async def mark_order_failed(
               );
             """,
             reason,
-            order_id,
+            order_id.strip(),
         )
 
         return result == "UPDATE 1"
@@ -336,7 +376,7 @@ async def mark_order_waiting_for_launch(
             WHERE order_id = $1
               AND status = 'PAID';
             """,
-            order_id,
+            order_id.strip(),
         )
 
         return result == "UPDATE 1"
@@ -372,7 +412,7 @@ async def mark_order_active(
                   'PAID_WAITING_FOR_LAUNCH'
               );
             """,
-            order_id,
+            order_id.strip(),
             expires_at,
         )
 
@@ -397,7 +437,7 @@ async def mark_order_expired(
             WHERE order_id = $1
               AND status = 'ACTIVE';
             """,
-            order_id,
+            order_id.strip(),
         )
 
         return result == "UPDATE 1"
@@ -406,10 +446,12 @@ async def mark_order_expired(
 async def get_payment_wallet(
     chain: str,
 ):
-    chain = (
+    chain = normalize_chain(
         chain
-        or ""
-    ).lower().strip()
+    )
+
+    if chain not in PAYMENT_CHAINS:
+        return None
 
     pool = await get_pool()
 
