@@ -1,26 +1,48 @@
+import asyncio
+
 from telegram import Bot
 
-from config import BOT_TOKEN, TRENDING_CHANNEL_ID
+from config import (
+    BOT_TOKEN,
+    TRENDING_CHANNEL_ID,
+)
+
 from database.connection import get_pool
 
 
 MAX_DISPLAYED_TRENDS = 10
 
+DEFAULT_PUBLISH_INTERVAL_SECONDS = 30
+
+MESSAGE_SETTING_KEY = (
+    "trending_channel_message_id"
+)
+
 
 def format_money(value):
     try:
         value = float(value or 0)
-    except (ValueError, TypeError):
+
+    except (
+        ValueError,
+        TypeError,
+    ):
         value = 0
 
     if value >= 1_000_000_000:
-        return f"${value / 1_000_000_000:.2f}B"
+        return (
+            f"${value / 1_000_000_000:.2f}B"
+        )
 
     if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
+        return (
+            f"${value / 1_000_000:.2f}M"
+        )
 
     if value >= 1_000:
-        return f"${value / 1_000:.2f}K"
+        return (
+            f"${value / 1_000:.2f}K"
+        )
 
     return f"${value:.2f}"
 
@@ -28,7 +50,11 @@ def format_money(value):
 def format_price_change(value):
     try:
         value = float(value or 0)
-    except (ValueError, TypeError):
+
+    except (
+        ValueError,
+        TypeError,
+    ):
         value = 0
 
     return f"{value:+.2f}%"
@@ -41,7 +67,7 @@ def chain_emoji(chain):
         "solana": "🟣",
         "robinhood": "🟠",
     }.get(
-        chain,
+        str(chain).lower(),
         "🌐",
     )
 
@@ -50,6 +76,7 @@ async def get_ranked_trends():
     pool = get_pool()
 
     async with pool.acquire() as conn:
+
         rows = await conn.fetch(
             """
             SELECT
@@ -86,10 +113,11 @@ async def get_setting(
     pool = get_pool()
 
     async with pool.acquire() as conn:
+
         return await conn.fetchval(
             """
             SELECT value
-            FROM settings
+            FROM system_settings
             WHERE key = $1
             """,
             key,
@@ -102,16 +130,17 @@ async def save_channel_message_id(
     pool = get_pool()
 
     async with pool.acquire() as conn:
+
         await conn.execute(
             """
-            INSERT INTO settings (
+            INSERT INTO system_settings (
                 key,
                 value,
                 updated_at
             )
             VALUES (
-                'trending_channel_message_id',
                 $1,
+                $2,
                 NOW()
             )
             ON CONFLICT (key)
@@ -119,30 +148,76 @@ async def save_channel_message_id(
                 value = EXCLUDED.value,
                 updated_at = NOW()
             """,
+            MESSAGE_SETTING_KEY,
             str(message_id),
         )
+
+
+def format_expiry(
+    expires_at,
+):
+    if not expires_at:
+        return None
+
+    try:
+        remaining = (
+            expires_at
+            - __import__(
+                "datetime"
+            ).datetime.now(
+                __import__(
+                    "datetime"
+                ).timezone.utc
+            )
+        )
+
+        seconds = int(
+            remaining.total_seconds()
+        )
+
+        if seconds <= 0:
+            return "Expired"
+
+        minutes = seconds // 60
+
+        hours = minutes // 60
+
+        minutes %= 60
+
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+
+        return f"{minutes}m"
+
+    except Exception:
+        return None
 
 
 async def build_trending_message():
     trends = await get_ranked_trends()
 
     if not trends:
+
         return (
             "🏛️ *THE BLOCK ROOM — TRENDING*\n\n"
             "🔎 No active tokens are currently trending.\n\n"
-            "📈 The market is being monitored continuously."
+            "📡 Market activity is being monitored "
+            "continuously."
         )
 
     lines = [
         "🏛️ *THE BLOCK ROOM — TRENDING*",
         "",
-        "🔥 *LIVE MARKET RANKINGS*",
+        "🔥 *LIVE MARKET BOARD*",
         "",
     ]
 
     for trend in trends:
 
-        rank = trend["rank"] or 0
+        rank = (
+            trend["rank"]
+            or 0
+        )
 
         token_name = (
             trend["token_name"]
@@ -154,7 +229,10 @@ async def build_trending_message():
             or "UNKNOWN"
         )
 
-        chain = trend["chain"]
+        chain = (
+            trend["chain"]
+            or "unknown"
+        )
 
         market_cap = format_money(
             trend["market_cap"]
@@ -173,15 +251,18 @@ async def build_trending_message():
         )
 
         score = float(
-            trend["score"] or 0
+            trend["score"]
+            or 0
         )
 
         buys = int(
-            trend["buys_24h"] or 0
+            trend["buys_24h"]
+            or 0
         )
 
         sells = int(
-            trend["sells_24h"] or 0
+            trend["sells_24h"]
+            or 0
         )
 
         paid_marker = (
@@ -197,21 +278,22 @@ async def build_trending_message():
         lines.append(
             f"*#{rank}* {emoji} "
             f"*{token_name}* "
-            f"({symbol}){paid_marker}"
+            f"({symbol})"
+            f"{paid_marker}"
         )
 
         lines.append(
-            f"💎 MC: {market_cap}  "
+            f"💰 MC: {market_cap}   "
             f"📊 Vol: {volume}"
         )
 
         lines.append(
-            f"💧 Liq: {liquidity}  "
+            f"💧 Liq: {liquidity}   "
             f"📈 {price_change}"
         )
 
         lines.append(
-            f"🟢 Buys: {buys}  "
+            f"🟢 Buys: {buys}   "
             f"🔴 Sells: {sells}"
         )
 
@@ -219,13 +301,23 @@ async def build_trending_message():
             f"⭐ Score: {score:.2f}"
         )
 
+        remaining = format_expiry(
+            trend["expires_at"]
+        )
+
+        if remaining:
+
+            lines.append(
+                f"⏳ Remaining: {remaining}"
+            )
+
         lines.append("")
 
     lines.extend(
         [
             "━━━━━━━━━━━━━━━━━━",
             "🔄 *Rankings update automatically*",
-            "📊 Powered by The Block Room market engine",
+            "📡 Powered by The Block Room",
         ]
     )
 
@@ -233,28 +325,42 @@ async def build_trending_message():
 
 
 async def publish_trending():
+
     if not BOT_TOKEN:
+
         print(
-            "Trending publisher: BOT_TOKEN is missing."
+            "Trending publisher: "
+            "BOT_TOKEN is missing."
         )
+
         return
 
     if not TRENDING_CHANNEL_ID:
+
         print(
             "Trending publisher: "
             "TRENDING_CHANNEL_ID is not configured."
         )
+
         return
 
     try:
+
         channel_id = int(
             TRENDING_CHANNEL_ID
         )
-    except ValueError:
+
+    except (
+        ValueError,
+        TypeError,
+    ):
+
         print(
             "Trending publisher: "
-            "TRENDING_CHANNEL_ID must be a valid Telegram ID."
+            "TRENDING_CHANNEL_ID must be "
+            "a valid Telegram ID."
         )
+
         return
 
     text = await build_trending_message()
@@ -264,16 +370,17 @@ async def publish_trending():
     )
 
     existing_message_id = await get_setting(
-        "trending_channel_message_id"
+        MESSAGE_SETTING_KEY
     )
 
     # --------------------------------------------------------
-    # TRY TO EDIT EXISTING MESSAGE
+    # EDIT EXISTING MESSAGE
     # --------------------------------------------------------
 
     if existing_message_id:
 
         try:
+
             await bot.edit_message_text(
                 chat_id=channel_id,
                 message_id=int(
@@ -286,9 +393,10 @@ async def publish_trending():
             return
 
         except Exception as exc:
+
             print(
-                "Could not edit existing trending "
-                f"message: {exc}"
+                "Could not edit existing "
+                f"trending message: {exc}"
             )
 
     # --------------------------------------------------------
@@ -296,6 +404,7 @@ async def publish_trending():
     # --------------------------------------------------------
 
     try:
+
         message = await bot.send_message(
             chat_id=channel_id,
             text=text,
@@ -311,12 +420,23 @@ async def publish_trending():
         )
 
     except Exception as exc:
+
         print(
-            f"Could not publish trending message: {exc}"
+            "Could not publish trending "
+            f"message: {exc}"
         )
+
+    finally:
+
+        try:
+            await bot.shutdown()
+
+        except Exception:
+            pass
 
 
 async def trending_publisher_worker():
+
     print(
         "Trending channel publisher started."
     )
@@ -324,18 +444,19 @@ async def trending_publisher_worker():
     while True:
 
         try:
+
             await publish_trending()
 
+        except asyncio.CancelledError:
+
+            raise
+
         except Exception as exc:
+
             print(
                 f"Trending publisher error: {exc}"
             )
 
-        # Ranking engine normally updates every 30 seconds.
-        # Publishing on the same interval keeps the channel
-        # synchronized without flooding it.
-        import asyncio
-
         await asyncio.sleep(
-            30
+            DEFAULT_PUBLISH_INTERVAL_SECONDS
         )
