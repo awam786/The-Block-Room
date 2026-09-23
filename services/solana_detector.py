@@ -7,15 +7,20 @@ import httpx
 from telegram import Bot
 
 from config import (
+    BOT_TOKEN,
     HELIUS_API_KEY,
     BUYBOT_POLL_SECONDS,
-    BOT_TOKEN,
 )
 
 from database.connection import get_pool
 
 from services.buybot_alert import (
     send_buy_alert,
+)
+
+from services.market_data import (
+    get_market_data_safe,
+    get_sol_price_usd,
 )
 
 
@@ -37,6 +42,7 @@ HELIUS_TRANSACTION_URL = (
 # ============================================================
 
 async def get_solana_tokens():
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -103,6 +109,7 @@ async def save_event(
     spent_amount_usd: Decimal,
     received_amount: Decimal,
 ):
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -145,6 +152,7 @@ async def save_event(
 async def get_buybot_settings(
     group_id: int,
 ):
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -168,6 +176,7 @@ async def get_buybot_settings(
 async def get_token_transactions(
     token_address: str,
 ):
+
     if not HELIUS_API_KEY:
 
         print(
@@ -228,6 +237,7 @@ async def get_token_transactions(
 async def get_transaction(
     signature: str,
 ):
+
     if not HELIUS_API_KEY:
         return None
 
@@ -293,7 +303,9 @@ def extract_buy(
 ) -> dict | None:
 
     token_address = (
-        token_address.lower()
+        str(token_address)
+        .strip()
+        .lower()
     )
 
     events = transaction.get(
@@ -329,7 +341,7 @@ def extract_buy(
     )
 
     # ========================================================
-    # FIND MONITORED TOKEN OUTPUT
+    # MONITORED TOKEN OUTPUT
     # ========================================================
 
     received = None
@@ -399,7 +411,7 @@ def extract_buy(
                 str(amount)
             )
 
-            decimal_places = int(
+            decimals_int = int(
                 decimals
             )
 
@@ -407,7 +419,7 @@ def extract_buy(
                 raw_amount
                 / (
                     Decimal(10)
-                    ** decimal_places
+                    ** decimals_int
                 )
             )
 
@@ -418,7 +430,7 @@ def extract_buy(
         received = {
             "amount": received_amount,
             "raw_amount": raw_amount,
-            "decimals": decimal_places,
+            "decimals": decimals_int,
         }
 
         break
@@ -440,7 +452,7 @@ def extract_buy(
     )
 
     # ========================================================
-    # NATIVE SOL INPUT
+    # SOL INPUT
     # ========================================================
 
     spent_sol = Decimal(
@@ -586,20 +598,12 @@ def extract_buy(
 async def process_token(
     token,
 ):
+
     token_address = str(
         token[
             "contract_address"
         ]
     )
-
-    transactions = (
-        await get_token_transactions(
-            token_address
-        )
-    )
-
-    if not transactions:
-        return
 
     group_id = int(
         token["group_id"]
@@ -617,12 +621,72 @@ async def process_token(
     if not settings["enabled"]:
         return
 
+    transactions = (
+        await get_token_transactions(
+            token_address
+        )
+    )
+
+    if not transactions:
+        return
+
     minimum_buy = Decimal(
         str(
-            settings["min_buy_usd"]
+            settings[
+                "min_buy_usd"
+            ]
             or 0
         )
     )
+
+    # ========================================================
+    # SOL PRICE
+    # ========================================================
+
+    sol_price_usd = None
+
+    if minimum_buy > 0:
+
+        try:
+
+            sol_price_usd = (
+                await get_sol_price_usd()
+            )
+
+        except Exception as exc:
+
+            print(
+                "Failed getting SOL price: "
+                f"{exc}"
+            )
+
+    # ========================================================
+    # MARKET DATA
+    # ========================================================
+
+    market_data = (
+        await get_market_data_safe(
+            chain="SOL",
+            token_address=token_address,
+        )
+    )
+
+    market_cap_usd = (
+        market_data.get(
+            "market_cap_usd"
+        )
+    )
+
+    dex_url = (
+        token["dex_url"]
+        or market_data.get(
+            "dex_url"
+        )
+    )
+
+    # ========================================================
+    # TRANSACTIONS
+    # ========================================================
 
     for transaction_summary in (
         transactions
@@ -647,7 +711,7 @@ async def process_token(
             continue
 
         # ----------------------------------------------------
-        # DUPLICATE PROTECTION
+        # DUPLICATE
         # ----------------------------------------------------
 
         if await event_exists(
@@ -659,7 +723,7 @@ async def process_token(
             continue
 
         # ----------------------------------------------------
-        # FETCH PARSED TRANSACTION
+        # PARSED TRANSACTION
         # ----------------------------------------------------
 
         transaction = (
@@ -689,28 +753,24 @@ async def process_token(
             continue
 
         # ----------------------------------------------------
-        # USD VALUE
+        # SOL → USD
         # ----------------------------------------------------
-        #
-        # At this stage we know the SOL amount,
-        # but we do not yet have a SOL/USD price.
-        #
-        # Therefore do NOT falsely label SOL as USD.
-        #
-        # The upcoming market-price service will
-        # calculate this properly.
-        #
 
         spent_usd = None
 
+        if (
+            buy["spent_sol"] > 0
+            and sol_price_usd is not None
+        ):
+
+            spent_usd = (
+                buy["spent_sol"]
+                * sol_price_usd
+            )
+
         # ----------------------------------------------------
-        # MINIMUM BUY FILTER
+        # MINIMUM BUY
         # ----------------------------------------------------
-        #
-        # Since USD conversion is not available yet,
-        # don't reject the transaction using a fake
-        # $0 value.
-        #
 
         if (
             minimum_buy > 0
@@ -735,7 +795,9 @@ async def process_token(
                 "buyer"
             ],
             spent_amount_usd=(
-                Decimal("0")
+                spent_usd
+                if spent_usd is not None
+                else Decimal("0")
             ),
             received_amount=buy[
                 "received_amount"
@@ -743,7 +805,7 @@ async def process_token(
         )
 
         # ----------------------------------------------------
-        # SEND SHARED ALERT
+        # SEND ALERT
         # ----------------------------------------------------
 
         try:
@@ -768,15 +830,13 @@ async def process_token(
                     buyer_address=buy[
                         "buyer"
                     ],
-                    spent_amount_usd=None,
+                    spent_amount_usd=spent_usd,
                     received_amount=buy[
                         "received_amount"
                     ],
                     tx_hash=signature,
-                    market_cap_usd=None,
-                    dex_url=token[
-                        "dex_url"
-                    ],
+                    market_cap_usd=market_cap_usd,
+                    dex_url=dex_url,
                     trending_url=None,
                 )
 
@@ -798,8 +858,12 @@ async def process_token(
             f"token={token['token_symbol']} | "
             f"spent_sol="
             f"{buy['spent_sol']} | "
+            f"spent_usd="
+            f"{spent_usd} | "
             f"received="
             f"{buy['received_amount']} | "
+            f"market_cap="
+            f"{market_cap_usd} | "
             f"buyer={buy['buyer']} | "
             f"tx={signature}"
         )
