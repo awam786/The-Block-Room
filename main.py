@@ -4,19 +4,19 @@ from telegram import Update
 
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
 from config import BOT_TOKEN
 
 from database.connection import (
-    close_db,
     init_db,
+    close_db,
 )
 
 from handlers.start import start_command
@@ -258,20 +258,163 @@ async def help_command(
         return
 
     await update.message.reply_text(
-        "🏛️ THE BLOCK ROOM\n\n"
+        "🏛️ *THE BLOCK ROOM*\n\n"
         "📈 /trend — List a token on trending\n"
-        "💰 /prices — View trending packages\n\n"
-        "🤖 /buybot — Manage BuyBot\n"
+        "📈 /trending — List a token on trending\n"
+        "💰 /prices — View trending packages\n"
+        "🤖 /buybot — Manage BuyBot in a group\n"
         "➕ /add — Add BuyBot token\n"
         "➖ /remove — Remove BuyBot token\n"
-        "📋 /tokens — View monitored tokens\n\n"
+        "📋 /tokens — View monitored tokens\n"
         "💬 /support — Contact support\n"
         "❓ /help — Show help",
+        parse_mode="Markdown",
     )
 
 
-def build_trend_conversation():
-    return ConversationHandler(
+def build_application() -> Application:
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(False)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # ---------------------------------------------------------
+    # BASIC COMMANDS
+    # ---------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "adminhelp",
+            admin_help,
+        )
+    )
+
+    # ---------------------------------------------------------
+    # BUYBOT COMMANDS
+    # ---------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "activebuybot",
+            activate_buybot,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removebuybot",
+            remove_buybot,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "tokens",
+            list_tokens,
+        )
+    )
+
+    # Menu callbacks and BuyBot settings callbacks.
+    register_buybot_callbacks(
+        application
+    )
+
+    # Main BuyBot conversation.
+    application.add_handler(
+        build_buybot_conversation()
+    )
+
+    # Custom BuyBot button conversation.
+    #
+    # This is separate from the main BuyBot conversation
+    # because adding a custom button requires text input.
+    from services.buybot import (
+        build_buybot_button_conversation,
+    )
+
+    application.add_handler(
+        build_buybot_button_conversation()
+    )
+
+    # ---------------------------------------------------------
+    # PRICING
+    # ---------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            [
+                "2hour",
+                "6hours",
+                "12hours",
+                "24hours",
+            ],
+            set_price,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "prices",
+            show_prices,
+        )
+    )
+
+    # ---------------------------------------------------------
+    # PAYMENT WALLETS
+    # ---------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            [
+                "BNB",
+                "ETH",
+                "SOL",
+            ],
+            set_wallet,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            [
+                "removeBNB",
+                "removeETH",
+                "removeSOL",
+            ],
+            remove_wallet,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "wallets",
+            show_wallets,
+        )
+    )
+
+    # ---------------------------------------------------------
+    # TRENDING / ORDER CONVERSATION
+    # ---------------------------------------------------------
+
+    trend_conversation = ConversationHandler(
         entry_points=[
             CommandHandler(
                 "trend",
@@ -333,139 +476,15 @@ def build_trend_conversation():
         allow_reentry=True,
     )
 
+    application.add_handler(
+        trend_conversation
+    )
+
+    return application
+
 
 def main():
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(False)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    # =========================
-    # BASIC COMMANDS
-    # =========================
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "adminhelp",
-            admin_help,
-        )
-    )
-
-    # =========================
-    # PRICING
-    # =========================
-
-    application.add_handler(
-        CommandHandler(
-            [
-                "2hour",
-                "6hours",
-                "12hours",
-                "24hours",
-            ],
-            set_price,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "prices",
-            show_prices,
-        )
-    )
-
-    # =========================
-    # PAYMENT WALLETS
-    # =========================
-
-    application.add_handler(
-        CommandHandler(
-            [
-                "BNB",
-                "ETH",
-                "SOL",
-            ],
-            set_wallet,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            [
-                "removeBNB",
-                "removeETH",
-                "removeSOL",
-            ],
-            remove_wallet,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "wallets",
-            show_wallets,
-        )
-    )
-
-    # =========================
-    # BUYBOT
-    # =========================
-
-    application.add_handler(
-        CommandHandler(
-            "activebuybot",
-            activate_buybot,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "removebuybot",
-            remove_buybot,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "tokens",
-            list_tokens,
-        )
-    )
-
-    application.add_handler(
-        build_buybot_conversation()
-    )
-
-    # Register BuyBot inline-button callbacks.
-    register_buybot_callbacks(
-        application
-    )
-
-    # =========================
-    # TRENDING
-    # =========================
-
-    application.add_handler(
-        build_trend_conversation()
-    )
+    application = build_application()
 
     print(
         "The Block Room is starting..."
