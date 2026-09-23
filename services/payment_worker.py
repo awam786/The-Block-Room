@@ -2,17 +2,11 @@ import asyncio
 
 from telegram import Bot
 
-from config import (
-    BOT_TOKEN,
-)
+from config import BOT_TOKEN
 
-from database.connection import (
-    get_pool,
-)
+from database.connection import get_pool
 
-from services.payment_verifier import (
-    verify_payment,
-)
+from services.payment_verifier import verify_payment
 
 from services.orders import (
     mark_order_paid,
@@ -71,17 +65,9 @@ async def process_order(
     bot: Bot,
     order,
 ):
-    order_id = order[
-        "order_id"
-    ]
-
-    user_id = order[
-        "user_id"
-    ]
-
-    tx_hash = order[
-        "transaction_hash"
-    ]
+    order_id = order["order_id"]
+    user_id = order["user_id"]
+    tx_hash = order["transaction_hash"]
 
     if not tx_hash:
         return
@@ -95,9 +81,7 @@ async def process_order(
     # PAYMENT VERIFIED
     # ---------------------------------------------------------
 
-    if result.get(
-        "valid"
-    ):
+    if result.get("valid"):
         changed = await mark_order_paid(
             order_id
         )
@@ -105,9 +89,10 @@ async def process_order(
         if not changed:
             return
 
-        amount = result.get(
-            "amount"
-        )
+        amount = result.get("amount")
+
+        if amount is None:
+            amount = order["amount"]
 
         await send_payment_message(
             bot,
@@ -126,9 +111,7 @@ async def process_order(
     # TEMPORARY / RPC / API ISSUE
     # ---------------------------------------------------------
 
-    if result.get(
-        "pending"
-    ):
+    if result.get("pending"):
         print(
             "Payment verification pending "
             f"order={order_id}: "
@@ -142,9 +125,7 @@ async def process_order(
     # ---------------------------------------------------------
 
     reason = (
-        result.get(
-            "reason"
-        )
+        result.get("reason")
         or "Payment could not be verified."
     )
 
@@ -178,36 +159,44 @@ async def payment_worker():
         token=BOT_TOKEN
     )
 
-    while True:
-        try:
-            orders = (
-                await get_submitted_orders()
+    try:
+        while True:
+            try:
+                orders = await get_submitted_orders()
+
+                for order in orders:
+                    try:
+                        await process_order(
+                            bot,
+                            order,
+                        )
+
+                    except Exception as exc:
+                        print(
+                            "Payment order processing "
+                            f"error order="
+                            f"{order['order_id']}: "
+                            f"{exc}"
+                        )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                print(
+                    "Payment worker error: "
+                    f"{exc}"
+                )
+
+            await asyncio.sleep(
+                POLL_SECONDS
             )
 
-            for order in orders:
-                try:
-                    await process_order(
-                        bot,
-                        order,
-                    )
-
-                except Exception as exc:
-                    print(
-                        "Payment order processing "
-                        f"error order="
-                        f"{order['order_id']}: "
-                        f"{exc}"
-                    )
-
-        except asyncio.CancelledError:
-            raise
-
+    finally:
+        try:
+            await bot.shutdown()
         except Exception as exc:
             print(
-                "Payment worker error: "
+                "Payment bot shutdown error: "
                 f"{exc}"
             )
-
-        await asyncio.sleep(
-            POLL_SECONDS
-        )
