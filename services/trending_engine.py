@@ -4,1000 +4,777 @@ from datetime import datetime, timezone
 
 from database.connection import get_pool
 
-from services.dex import (
-    get_token_pairs,
-    choose_best_pair,
-    parse_pair,
-)
+from services.dex import get_best_token_pair
 
 
-DEFAULT_UPDATE_SECONDS = 30
-DEFAULT_INACTIVITY_MINUTES = 10
+UPDATE_SECONDS = 30
+INACTIVITY_MINUTES = 10
 
-LOW_MC_THRESHOLD = 50_000
-HIGH_MC_THRESHOLD = 100_000
-TOP_MC_THRESHOLD = 500_000
+MARKET_CAP_LOW = 50_000
+MARKET_CAP_MEDIUM = 100_000
+MARKET_CAP_HIGH = 500_000
+
+SUPPORTED_CHAINS = {
+    "bnb",
+    "ethereum",
+    "solana",
+    "robinhood",
+}
 
 
-async def get_setting(
-    key: str,
-    default: float,
-):
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        value = await conn.fetchval(
-            """
-            SELECT value
-            FROM system_settings
-            WHERE key = $1
-            """,
-            key,
-        )
-
-    if value is None:
-        return default
-
+def safe_number(value, default=0.0):
     try:
-        return float(value)
+        if value is None:
+            return default
 
-    except (
-        ValueError,
-        TypeError,
-    ):
+        number = float(value)
+
+        if not math.isfinite(number):
+            return default
+
+        return number
+
+    except (TypeError, ValueError):
         return default
 
 
-def safe_number(value):
-    try:
-        return float(value or 0)
-
-    except (
-        ValueError,
-        TypeError,
-    ):
-        return 0.0
+def clamp(value, minimum=0.0, maximum=100.0):
+    return max(
+        minimum,
+        min(maximum, value),
+    )
 
 
-def logarithmic_score(
-    value: float,
-    maximum: float,
-):
+def log_score(value):
+    value = safe_number(value)
+
     if value <= 0:
         return 0.0
 
-    if maximum <= 0:
+    return clamp(
+        math.log10(value + 1) * 10
+    )
+
+
+def percentage_score(value):
+    value = abs(safe_number(value))
+
+    if value <= 0:
         return 0.0
 
-    return min(
-        100.0,
-        (
-            math.log10(value + 1)
-            / math.log10(maximum + 1)
-        )
-        * 100.0,
-    )
+    return clamp(value)
 
 
-def calculate_market_score(
-    volume_24h: float,
-    liquidity: float,
-    market_cap: float,
-    buys_24h: float,
-    price_change_24h: float,
-    recent_activity: float,
-):
-    volume_score = logarithmic_score(
-        volume_24h,
-        10_000_000,
-    )
-
-    liquidity_score = logarithmic_score(
-        liquidity,
-        5_000_000,
-    )
-
-    market_cap_score = logarithmic_score(
-        market_cap,
-        50_000_000,
-    )
-
-    buy_score = logarithmic_score(
-        buys_24h,
-        10_000,
-    )
-
-    momentum = max(
-        -100.0,
-        min(
-            100.0,
-            price_change_24h,
-        ),
-    )
-
-    momentum_score = (
-        (momentum + 100.0)
-        / 200.0
-        * 100.0
-    )
-
-    recent_score = max(
-        0.0,
-        min(
-            100.0,
-            recent_activity,
-        ),
-    )
-
-    return (
-        volume_score * 0.30
-        + liquidity_score * 0.20
-        + market_cap_score * 0.15
-        + buy_score * 0.15
-        + momentum_score * 0.10
-        + recent_score * 0.05
-    )
-
-
-def calculate_paid_placement_score(
-    market_score: float,
-    market_cap: float,
-    has_activity: bool,
-):
+def calculate_market_score(data):
     """
-    Paid promotion is handled separately from the
-    natural market score.
+    Natural market score.
 
-    This provides paid listings with visibility while
-    preventing an inactive low-cap token from reaching #1
-    simply because it paid for promotion.
+    Weights:
+        30% 24h volume
+        20% liquidity
+        15% market cap
+        15% buy activity
+        10% price momentum
+         5% recent activity
+
+    The natural component intentionally totals 95%.
+    Paid placement is handled separately.
     """
 
-    if not has_activity:
-        return 0.0
-
-    if market_cap >= TOP_MC_THRESHOLD:
-        return 50.0
-
-    if market_cap >= HIGH_MC_THRESHOLD:
-        return 30.0
-
-    if market_cap >= LOW_MC_THRESHOLD:
-        return 15.0
-
-    return 5.0
-
-
-def calculate_final_score(
-    market_score: float,
-    paid_score: float,
-):
-    return (
-        market_score
-        + paid_score
-    )
-
-
-async def fetch_market_data(
-    chain: str,
-    contract_address: str,
-):
-    try:
-        pairs = await get_token_pairs(
-            chain,
-            contract_address,
-        )
-
-        pair = choose_best_pair(
-            pairs
-        )
-
-        if not pair:
-            return None
-
-        return parse_pair(
-            pair
-        )
-
-    except Exception as exc:
-        print(
-            f"Market data error for "
-            f"{chain}:{contract_address}: {exc}"
-        )
-
-        return None
-
-
-async def get_active_trends():
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                t.id,
-                t.order_id,
-                t.chain,
-                t.contract_address,
-                t.token_name,
-                t.token_symbol,
-                t.market_cap,
-                t.volume_24h,
-                t.liquidity,
-                t.price_change_24h,
-                t.buys_24h,
-                t.sells_24h,
-                t.score,
-                t.rank,
-                t.paid_promotion,
-                t.last_activity_at,
-                t.last_volume_24h,
-                t.inactivity_started_at,
-                t.started_at,
-                t.expires_at
-            FROM trends t
-            WHERE t.status = 'ACTIVE'
-            ORDER BY t.id ASC
-            """
-        )
-
-    return rows
-
-
-def has_meaningful_activity(
-    market_data: dict,
-    previous_volume: float,
-):
-    volume = safe_number(
-        market_data.get(
-            "volume_24h"
-        )
-    )
-
-    buys = safe_number(
-        market_data.get(
-            "buys_24h"
-        )
-    )
-
-    sells = safe_number(
-        market_data.get(
-            "sells_24h"
-        )
-    )
-
-    total_transactions = (
-        buys + sells
-    )
-
-    if total_transactions > 0:
-        return True
-
-    if volume > previous_volume:
-        return True
-
-    return False
-
-
-async def update_trend_market_data(
-    trend,
-    market_data: dict,
-    market_score: float,
-    final_score: float,
-):
-    pool = get_pool()
-
-    now = datetime.now(
-        timezone.utc
-    )
-
-    volume = safe_number(
-        market_data.get(
-            "volume_24h"
-        )
-    )
-
-    market_cap = safe_number(
-        market_data.get(
-            "market_cap"
-        )
+    volume_24h = safe_number(
+        data.get("volume_24h")
     )
 
     liquidity = safe_number(
-        market_data.get(
-            "liquidity_usd"
+        data.get("liquidity_usd")
+    )
+
+    market_cap = safe_number(
+        data.get("market_cap")
+    )
+
+    buys_24h = safe_number(
+        data.get("buys_24h")
+    )
+
+    sells_24h = safe_number(
+        data.get("sells_24h")
+    )
+
+    price_change_1h = safe_number(
+        data.get("price_change_1h")
+    )
+
+    volume_5m = safe_number(
+        data.get("volume_5m")
+    )
+
+    buys_5m = safe_number(
+        data.get("buys_5m")
+    )
+
+    volume_score = log_score(
+        volume_24h
+    )
+
+    liquidity_score = log_score(
+        liquidity
+    )
+
+    market_cap_score = log_score(
+        market_cap
+    )
+
+    total_trades = buys_24h + sells_24h
+
+    if total_trades > 0:
+        buy_ratio = (
+            buys_24h / total_trades
+        ) * 100
+    else:
+        buy_ratio = 0
+
+    buy_activity_score = clamp(
+        buy_ratio
+    )
+
+    momentum_score = clamp(
+        50 + (
+            price_change_1h * 2
         )
     )
 
-    price_change = safe_number(
-        market_data.get(
-            "price_change_24h"
-        )
+    recent_activity_raw = (
+        log_score(volume_5m)
+        + log_score(buys_5m * 100)
+    ) / 2
+
+    recent_activity_score = clamp(
+        recent_activity_raw
     )
 
-    buys = int(
-        safe_number(
-            market_data.get(
-                "buys_24h"
-            )
-        )
+    score = (
+        volume_score * 0.30
+        + liquidity_score * 0.20
+        + market_cap_score * 0.15
+        + buy_activity_score * 0.15
+        + momentum_score * 0.10
+        + recent_activity_score * 0.05
     )
 
-    sells = int(
-        safe_number(
-            market_data.get(
-                "sells_24h"
-            )
-        )
+    return round(
+        max(0.0, score),
+        4,
     )
 
-    previous_volume = safe_number(
-        trend["last_volume_24h"]
+
+def calculate_paid_boost(data):
+    """
+    Paid promotion placement boost.
+
+    This is intentionally separate from the natural
+    95% market score.
+    """
+
+    market_cap = safe_number(
+        data.get("market_cap")
     )
 
-    active_now = has_meaningful_activity(
-        market_data,
-        previous_volume,
+    volume_24h = safe_number(
+        data.get("volume_24h")
     )
 
-    inactivity_started_at = (
-        trend["inactivity_started_at"]
+    buys_5m = safe_number(
+        data.get("buys_5m")
     )
 
-    last_activity_at = (
-        trend["last_activity_at"]
+    volume_5m = safe_number(
+        data.get("volume_5m")
     )
 
-    if active_now:
-        last_activity_at = now
-        inactivity_started_at = None
+    active_now = (
+        buys_5m > 0
+        or volume_5m > 0
+    )
 
-    elif inactivity_started_at is None:
-        inactivity_started_at = now
+    if not active_now:
+        return 0.0
 
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE trends
-            SET
-                score = $1,
-                volume_24h = $2,
-                market_cap = $3,
-                liquidity = $4,
-                price_change_24h = $5,
-                buys_24h = $6,
-                sells_24h = $7,
-                last_activity_at = $8,
-                last_volume_24h = $9,
-                inactivity_started_at = $10,
-                updated_at = NOW()
-            WHERE id = $11
-            """,
-            final_score,
-            volume,
-            market_cap,
-            liquidity,
-            price_change,
-            buys,
-            sells,
-            last_activity_at,
-            volume,
-            inactivity_started_at,
-            trend["id"],
-        )
+    if market_cap >= MARKET_CAP_HIGH:
+        return 50.0
 
-    return {
-        "active": active_now,
-        "market_score": market_score,
-        "final_score": final_score,
-        "market_cap": market_cap,
-        "volume": volume,
-    }
+    if market_cap >= MARKET_CAP_MEDIUM:
+        return 30.0
+
+    if market_cap >= MARKET_CAP_LOW:
+        return 15.0
+
+    if volume_24h > 0:
+        return 5.0
+
+    return 0.0
 
 
-async def remove_inactive_trend(
-    trend_id: int,
+def has_recent_activity(data):
+    volume_5m = safe_number(
+        data.get("volume_5m")
+    )
+
+    buys_5m = safe_number(
+        data.get("buys_5m")
+    )
+
+    sells_5m = safe_number(
+        data.get("sells_5m")
+    )
+
+    return (
+        volume_5m > 0
+        or buys_5m > 0
+        or sells_5m > 0
+    )
+
+
+def is_market_active(data):
+    volume_24h = safe_number(
+        data.get("volume_24h")
+    )
+
+    volume_5m = safe_number(
+        data.get("volume_5m")
+    )
+
+    buys_24h = safe_number(
+        data.get("buys_24h")
+    )
+
+    sells_24h = safe_number(
+        data.get("sells_24h")
+    )
+
+    return (
+        volume_24h > 0
+        or volume_5m > 0
+        or buys_24h > 0
+        or sells_24h > 0
+    )
+
+
+def get_final_score(
+    market_score,
+    paid_boost,
 ):
-    pool = get_pool()
+    return round(
+        safe_number(market_score)
+        + safe_number(paid_boost),
+        4,
+    )
 
-    async with pool.acquire() as conn:
-        await conn.execute(
+
+async def get_active_trends():
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
             """
-            UPDATE trends
-            SET
-                status = 'REMOVED_INACTIVE',
-                rank = NULL,
-                updated_at = NOW()
+            SELECT
+                id,
+                order_id,
+                user_id,
+                chain,
+                token_address,
+                token_name,
+                token_symbol,
+                duration_hours,
+                amount,
+                status,
+                created_at,
+                activated_at,
+                expires_at,
+                rank,
+                market_score,
+                market_cap,
+                volume_24h,
+                liquidity_usd,
+                buy_activity,
+                price_change_1h,
+                last_activity_at
+            FROM trends
+            WHERE status = 'ACTIVE'
+            ORDER BY
+                COALESCE(rank, 999999),
+                created_at ASC;
+            """
+        )
+
+        return rows
+
+
+async def get_trend_by_id(trend_id):
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+        return await connection.fetchrow(
+            """
+            SELECT
+                id,
+                order_id,
+                user_id,
+                chain,
+                token_address,
+                token_name,
+                token_symbol,
+                duration_hours,
+                amount,
+                status,
+                created_at,
+                activated_at,
+                expires_at,
+                rank,
+                market_score,
+                market_cap,
+                volume_24h,
+                liquidity_usd,
+                buy_activity,
+                price_change_1h,
+                last_activity_at
+            FROM trends
             WHERE id = $1
-              AND status = 'ACTIVE'
+            LIMIT 1;
             """,
             trend_id,
         )
 
 
-async def remove_expired_trends():
-    pool = get_pool()
+async def update_trend_market_data(
+    trend_id,
+    data,
+    score,
+    last_activity_at=None,
+):
+    pool = await get_pool()
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
+    market_cap = safe_number(
+        data.get("market_cap")
+    )
+
+    volume_24h = safe_number(
+        data.get("volume_24h")
+    )
+
+    liquidity_usd = safe_number(
+        data.get("liquidity_usd")
+    )
+
+    buys_24h = safe_number(
+        data.get("buys_24h")
+    )
+
+    sells_24h = safe_number(
+        data.get("sells_24h")
+    )
+
+    total_trades = (
+        buys_24h + sells_24h
+    )
+
+    buy_activity = (
+        (buys_24h / total_trades) * 100
+        if total_trades > 0
+        else 0
+    )
+
+    price_change_1h = safe_number(
+        data.get("price_change_1h")
+    )
+
+    if last_activity_at is None:
+        await connection_update(
+            trend_id,
+            market_cap,
+            volume_24h,
+            liquidity_usd,
+            buy_activity,
+            price_change_1h,
+            score,
+        )
+
+        return
+
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            UPDATE trends
+            SET
+                market_score = $2,
+                market_cap = $3,
+                volume_24h = $4,
+                liquidity_usd = $5,
+                buy_activity = $6,
+                price_change_1h = $7,
+                last_activity_at = $8
+            WHERE id = $1;
+            """,
+            trend_id,
+            score,
+            market_cap,
+            volume_24h,
+            liquidity_usd,
+            buy_activity,
+            price_change_1h,
+            last_activity_at,
+        )
+
+
+async def connection_update(
+    trend_id,
+    market_cap,
+    volume_24h,
+    liquidity_usd,
+    buy_activity,
+    price_change_1h,
+    score,
+):
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            UPDATE trends
+            SET
+                market_score = $2,
+                market_cap = $3,
+                volume_24h = $4,
+                liquidity_usd = $5,
+                buy_activity = $6,
+                price_change_1h = $7
+            WHERE id = $1;
+            """,
+            trend_id,
+            score,
+            market_cap,
+            volume_24h,
+            liquidity_usd,
+            buy_activity,
+            price_change_1h,
+        )
+
+
+async def update_trend_rank(
+    trend_id,
+    rank,
+):
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            UPDATE trends
+            SET rank = $2
+            WHERE id = $1;
+            """,
+            trend_id,
+            rank,
+        )
+
+
+async def remove_inactive_trend(
+    trend_id,
+):
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+        await connection.execute(
             """
             UPDATE trends
             SET
                 status = 'EXPIRED',
-                rank = NULL,
-                updated_at = NOW()
+                rank = NULL
+            WHERE id = $1
+              AND status = 'ACTIVE';
+            """,
+            trend_id,
+        )
+
+
+async def expire_old_trends():
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            UPDATE trends
+            SET
+                status = 'EXPIRED',
+                rank = NULL
             WHERE status = 'ACTIVE'
               AND expires_at IS NOT NULL
-              AND expires_at <= NOW()
-            RETURNING id, order_id
+              AND expires_at <= NOW();
             """
         )
 
-        for row in rows:
-            await conn.execute(
-                """
-                UPDATE orders
-                SET
-                    status = 'EXPIRED',
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                row["order_id"],
-            )
 
-    return rows
+def parse_last_activity(
+    value,
+):
+    if value is None:
+        return None
+
+    if value.tzinfo is None:
+        return value.replace(
+            tzinfo=timezone.utc
+        )
+
+    return value
 
 
-def determine_paid_priority(
-    market_cap: float,
-    market_score: float,
-    has_activity: bool,
+def inactive_too_long(
+    last_activity_at,
+):
+    if last_activity_at is None:
+        return False
+
+    last_activity_at = parse_last_activity(
+        last_activity_at
+    )
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    elapsed = (
+        now - last_activity_at
+    ).total_seconds()
+
+    return (
+        elapsed
+        >= INACTIVITY_MINUTES * 60
+    )
+
+
+def extract_activity_time(
+    data,
+    existing_last_activity,
 ):
     """
-    Preferred visibility area:
-
-    Below $50K:
-        #3-#5 area
-
-    $50K-$100K:
-        #3-#4 area
-
-    Above $100K:
-        #2-#3 area
-
-    $500K+:
-        Eligible for #1
+    Keep the existing timestamp unless fresh
+    five-minute activity is detected.
     """
 
-    if not has_activity:
-        return 5
+    if not has_recent_activity(data):
+        return existing_last_activity
 
-    if market_cap >= TOP_MC_THRESHOLD:
-        return 1
-
-    if market_cap >= HIGH_MC_THRESHOLD:
-        return 3
-
-    if market_cap >= LOW_MC_THRESHOLD:
-        return 4
-
-    return 5
+    return datetime.now(
+        timezone.utc
+    )
 
 
-async def assign_ranks(
-    evaluated_trends,
+async def process_trend(
+    trend,
 ):
-    """
-    Hybrid ranking system.
+    trend_id = trend["id"]
+    chain = (
+        str(trend["chain"])
+        .strip()
+        .lower()
+    )
+    token_address = (
+        trend["token_address"]
+    )
 
-    Natural market performance remains important.
+    if chain not in SUPPORTED_CHAINS:
+        return {
+            "trend_id": trend_id,
+            "active": False,
+            "reason": "UNSUPPORTED_CHAIN",
+        }
 
-    Paid promotion provides protected visibility
-    according to market-cap and activity rules.
+    try:
+        pair = await get_best_token_pair(
+            chain,
+            token_address,
+        )
+    except Exception as exc:
+        print(
+            "Trending market-data error "
+            f"trend={trend_id}: {exc}"
+        )
 
-    An inactive paid token cannot buy #1.
-    """
+        return {
+            "trend_id": trend_id,
+            "active": True,
+            "reason": "MARKET_DATA_ERROR",
+        }
 
-    if not evaluated_trends:
-        return []
-
-    paid_candidates = []
-    normal_candidates = []
-
-    for item in evaluated_trends:
-
-        if item["paid_promotion"]:
-
-            priority = determine_paid_priority(
-                item["market_cap"],
-                item["market_score"],
-                item["has_activity"],
+    if not pair:
+        if inactive_too_long(
+            trend["last_activity_at"]
+        ):
+            await remove_inactive_trend(
+                trend_id
             )
 
-            item["paid_priority"] = priority
+            return {
+                "trend_id": trend_id,
+                "active": False,
+                "reason": "INACTIVE",
+            }
 
-            paid_candidates.append(
-                item
+        return {
+            "trend_id": trend_id,
+            "active": True,
+            "reason": "NO_PAIR",
+        }
+
+    data = pair
+
+    active = is_market_active(
+        data
+    )
+
+    previous_activity = (
+        trend["last_activity_at"]
+    )
+
+    last_activity = extract_activity_time(
+        data,
+        previous_activity,
+    )
+
+    if (
+        not active
+        and inactive_too_long(
+            previous_activity
+        )
+    ):
+        await remove_inactive_trend(
+            trend_id
+        )
+
+        return {
+            "trend_id": trend_id,
+            "active": False,
+            "reason": "INACTIVE",
+        }
+
+    market_score = calculate_market_score(
+        data
+    )
+
+    paid_boost = calculate_paid_boost(
+        data
+    )
+
+    final_score = get_final_score(
+        market_score,
+        paid_boost,
+    )
+
+    await update_trend_market_data(
+        trend_id=trend_id,
+        data=data,
+        score=final_score,
+        last_activity_at=last_activity,
+    )
+
+    return {
+        "trend_id": trend_id,
+        "active": True,
+        "score": final_score,
+        "market_score": market_score,
+        "paid_boost": paid_boost,
+        "market_cap": safe_number(
+            data.get("market_cap")
+        ),
+        "volume_24h": safe_number(
+            data.get("volume_24h")
+        ),
+        "liquidity_usd": safe_number(
+            data.get("liquidity_usd")
+        ),
+    }
+
+
+async def recalculate_ranks():
+    trends = await get_active_trends()
+
+    scored = []
+
+    for trend in trends:
+        try:
+            result = await process_trend(
+                trend
             )
 
-        else:
-            normal_candidates.append(
-                item
+            if result.get("active"):
+                scored.append(
+                    {
+                        "trend": trend,
+                        "result": result,
+                    }
+                )
+
+        except Exception as exc:
+            print(
+                "Trend processing error "
+                f"trend={trend['id']}: {exc}"
             )
 
-    normal_candidates.sort(
+    scored.sort(
         key=lambda item: (
-            item["market_score"],
-            item["final_score"],
+            safe_number(
+                item["result"].get(
+                    "score"
+                )
+            ),
+            safe_number(
+                item["result"].get(
+                    "volume_24h"
+                )
+            ),
+            safe_number(
+                item["result"].get(
+                    "liquidity_usd"
+                )
+            ),
         ),
         reverse=True,
     )
 
-    paid_candidates.sort(
-        key=lambda item: (
-            item["paid_priority"],
-            -item["market_score"],
-        )
-    )
-
-    final_order = []
-
-    used_ids = set()
-
-    # --------------------------------------------------------
-    # Eligible $500K+ paid tokens.
-    # Strongest eligible paid token can occupy #1.
-    # --------------------------------------------------------
-
-    top_paid = [
-        item
-        for item in paid_candidates
-        if (
-            item["paid_priority"] == 1
-            and item["has_activity"]
-        )
-    ]
-
-    if top_paid:
-
-        top_paid.sort(
-            key=lambda item: (
-                item["market_score"],
-                item["final_score"],
-            ),
-            reverse=True,
+    for index, item in enumerate(
+        scored,
+        start=1,
+    ):
+        await update_trend_rank(
+            item["trend"]["id"],
+            index,
         )
 
-        winner = top_paid[0]
-
-        final_order.append(
-            winner
-        )
-
-        used_ids.add(
-            winner["id"]
-        )
-
-    # --------------------------------------------------------
-    # Remaining paid listings.
-    # --------------------------------------------------------
-
-    remaining_paid = [
-        item
-        for item in paid_candidates
-        if item["id"] not in used_ids
-    ]
-
-    remaining_paid.sort(
-        key=lambda item: (
-            item["paid_priority"],
-            -item["market_score"],
-        )
-    )
-
-    for paid in remaining_paid:
-
-        desired_rank = paid[
-            "paid_priority"
-        ]
-
-        if desired_rank <= 1:
-            desired_rank = 2
-
-        elif desired_rank <= 3:
-            desired_rank = 3
-
-        elif desired_rank <= 4:
-            desired_rank = 4
-
-        else:
-            desired_rank = 5
-
-        insert_index = min(
-            max(
-                desired_rank - 1,
-                0,
-            ),
-            len(final_order),
-        )
-
-        final_order.insert(
-            insert_index,
-            paid,
-        )
-
-        used_ids.add(
-            paid["id"]
-        )
-
-    # --------------------------------------------------------
-    # Fill remaining positions with organic listings.
-    # --------------------------------------------------------
-
-    for item in normal_candidates:
-
-        if item["id"] in used_ids:
-            continue
-
-        final_order.append(
-            item
-        )
-
-    # --------------------------------------------------------
-    # Protect the intended paid visibility area.
-    # --------------------------------------------------------
-
-    protected_paid = [
-        item
-        for item in final_order
-        if (
-            item["paid_promotion"]
-            and item["has_activity"]
-            and item["market_cap"]
-            < TOP_MC_THRESHOLD
-        )
-    ]
-
-    for item in protected_paid:
-
-        if item["market_cap"] < LOW_MC_THRESHOLD:
-            target_rank = 5
-
-        elif item["market_cap"] < HIGH_MC_THRESHOLD:
-            target_rank = 4
-
-        else:
-            target_rank = 3
-
-        try:
-            current_index = final_order.index(
-                item
-            )
-
-        except ValueError:
-            continue
-
-        current_rank = (
-            current_index + 1
-        )
-
-        if current_rank > target_rank:
-
-            final_order.pop(
-                current_index
-            )
-
-            target_index = min(
-                target_rank - 1,
-                len(final_order),
-            )
-
-            final_order.insert(
-                target_index,
-                item,
-            )
-
-    # --------------------------------------------------------
-    # Final rule:
-    #
-    # An active $500K+ paid token may compete naturally
-    # for #1.
-    #
-    # Lower-cap paid tokens stay protected in their
-    # visibility zones.
-    # --------------------------------------------------------
-
-    if len(final_order) > 1:
-
-        top_eligible = [
-            item
-            for item in final_order
-            if (
-                item["market_cap"]
-                >= TOP_MC_THRESHOLD
-                and item["has_activity"]
-            )
-        ]
-
-        if top_eligible:
-
-            top_eligible.sort(
-                key=lambda item: (
-                    item["market_score"],
-                    item["final_score"],
-                ),
-                reverse=True,
-            )
-
-            strongest = top_eligible[0]
-
-            current_index = final_order.index(
-                strongest
-            )
-
-            if current_index != 0:
-
-                final_order.pop(
-                    current_index
-                )
-
-                final_order.insert(
-                    0,
-                    strongest,
-                )
-
-    return final_order
-
-
-async def save_ranks(
-    ranked_trends,
-):
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-
-            for rank, item in enumerate(
-                ranked_trends,
-                start=1,
-            ):
-                await conn.execute(
-                    """
-                    UPDATE trends
-                    SET
-                        rank = $1,
-                        updated_at = NOW()
-                    WHERE id = $2
-                      AND status = 'ACTIVE'
-                    """,
-                    rank,
-                    item["id"],
-                )
-
-
-async def run_trending_cycle():
-    inactivity_minutes = await get_setting(
-        "trending_inactivity_minutes",
-        DEFAULT_INACTIVITY_MINUTES,
-    )
-
-    trends = await get_active_trends()
-
-    evaluated = []
-
-    for trend in trends:
-
-        market_data = await fetch_market_data(
-            trend["chain"],
-            trend["contract_address"],
-        )
-
-        if not market_data:
-            # Temporary API failure must not immediately
-            # remove an active listing.
-            continue
-
-        volume = safe_number(
-            market_data.get(
-                "volume_24h"
-            )
-        )
-
-        liquidity = safe_number(
-            market_data.get(
-                "liquidity_usd"
-            )
-        )
-
-        market_cap = safe_number(
-            market_data.get(
-                "market_cap"
-            )
-        )
-
-        buys = safe_number(
-            market_data.get(
-                "buys_24h"
-            )
-        )
-
-        price_change = safe_number(
-            market_data.get(
-                "price_change_24h"
-            )
-        )
-
-        # ----------------------------------------------------
-        # Recent activity score.
-        # ----------------------------------------------------
-
-        recent_activity = 100.0
-
-        if trend["last_activity_at"]:
-
-            elapsed = (
-                datetime.now(
-                    timezone.utc
-                )
-                - trend["last_activity_at"]
-            ).total_seconds()
-
-            recent_activity = max(
-                0.0,
-                100.0
-                - (
-                    elapsed
-                    / 600.0
-                    * 100.0
-                ),
-            )
-
-        market_score = calculate_market_score(
-            volume,
-            liquidity,
-            market_cap,
-            buys,
-            price_change,
-            recent_activity,
-        )
-
-        previous_volume = safe_number(
-            trend["last_volume_24h"]
-        )
-
-        has_activity = has_meaningful_activity(
-            market_data,
-            previous_volume,
-        )
-
-        paid_score = 0.0
-
-        if trend["paid_promotion"]:
-
-            paid_score = (
-                calculate_paid_placement_score(
-                    market_score,
-                    market_cap,
-                    has_activity,
-                )
-            )
-
-        final_score = calculate_final_score(
-            market_score,
-            paid_score,
-        )
-
-        result = await update_trend_market_data(
-            trend,
-            market_data,
-            market_score,
-            final_score,
-        )
-
-        inactivity_started_at = (
-            trend["inactivity_started_at"]
-        )
-
-        if (
-            not has_activity
-            and inactivity_started_at
-        ):
-
-            inactive_seconds = (
-                datetime.now(
-                    timezone.utc
-                )
-                - inactivity_started_at
-            ).total_seconds()
-
-            if (
-                inactive_seconds
-                >= inactivity_minutes * 60
-            ):
-
-                await remove_inactive_trend(
-                    trend["id"]
-                )
-
-                print(
-                    f"Removed inactive trend "
-                    f"{trend['token_symbol']} "
-                    f"after "
-                    f"{inactivity_minutes} minutes."
-                )
-
-                continue
-
-        evaluated.append(
-            {
-                "id": trend["id"],
-                "paid_promotion": bool(
-                    trend["paid_promotion"]
-                ),
-                "market_cap": market_cap,
-                "market_score": market_score,
-                "final_score": final_score,
-                "has_activity": has_activity,
-            }
-        )
-
-    ranked = await assign_ranks(
-        evaluated
-    )
-
-    if ranked:
-        await save_ranks(
-            ranked
-        )
-
-    return ranked
+    return scored
 
 
 async def trending_engine_worker():
     print(
-        "Trending engine started."
+        "Trending engine worker started."
     )
 
     while True:
-
         try:
+            await expire_old_trends()
 
-            update_seconds = int(
-                await get_setting(
-                    "trending_update_seconds",
-                    DEFAULT_UPDATE_SECONDS,
-                )
-            )
-
-            await remove_expired_trends()
-
-            ranked = await run_trending_cycle()
-
-            if ranked:
-
-                print(
-                    "Trending rankings updated: "
-                    + ", ".join(
-                        f"#{index + 1}"
-                        f"={item['id']}"
-                        for index, item
-                        in enumerate(ranked)
-                    )
-                )
+            await recalculate_ranks()
 
         except asyncio.CancelledError:
             raise
 
         except Exception as exc:
-
             print(
-                f"Trending engine error: {exc}"
-            )
-
-            update_seconds = (
-                DEFAULT_UPDATE_SECONDS
+                "Trending engine error: "
+                f"{exc}"
             )
 
         await asyncio.sleep(
-            update_seconds
+            UPDATE_SECONDS
         )
