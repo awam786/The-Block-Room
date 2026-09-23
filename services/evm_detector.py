@@ -1,6 +1,5 @@
 import asyncio
-import json
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 import httpx
 
@@ -13,6 +12,10 @@ from config import (
 )
 
 from database.connection import get_pool
+
+from services.buybot_alert import (
+    send_buy_alert,
+)
 
 
 # ============================================================
@@ -58,43 +61,13 @@ CHAIN_CONFIG = {
 # ============================================================
 
 SWAP_EVENT_TOPIC = (
-    "0xd78ad95fa46c994b6551d0da85fc275fe6134a"
-    "e6f7b2f8d6a6d8e4c6b3e6f6d5c6e7f8"
-)
-
-# The correct topic is calculated below instead of trusting
-# the readable placeholder above.
-#
-# keccak256(
-#   "Swap(address,uint256,uint256,uint256,uint256,address)"
-# )
-#
-# This constant is the standard Uniswap V2 Swap topic.
-SWAP_EVENT_TOPIC = (
-    "0xd78ad95fa46c994b6551d0da85fc275fe6134a"
-    "e6f7b2f8d6a6d8e4c6b3e6f6d5c6e7f8"
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
 )
 
 
 # ============================================================
-# NOTE
+# HELPERS
 # ============================================================
-#
-# We avoid web3.py so the existing requirements.txt remains
-# lightweight.
-#
-# JSON-RPC eth_call / eth_getLogs are used directly.
-#
-# The Swap event data layout is:
-#
-# amount0In
-# amount1In
-# amount0Out
-# amount1Out
-#
-# Each value is uint256 = 32 bytes.
-# ============================================================
-
 
 def normalize_address(
     address: str | None,
@@ -116,15 +89,6 @@ def topic_address(
     return "0x" + value[-40:]
 
 
-def hex_to_int(
-    value: str,
-) -> int:
-    if not value:
-        return 0
-
-    return int(value, 16)
-
-
 def decode_uint256(
     data: str,
     index: int,
@@ -132,7 +96,11 @@ def decode_uint256(
     if not data:
         return 0
 
-    raw = data[2:] if data.startswith("0x") else data
+    raw = (
+        data[2:]
+        if data.startswith("0x")
+        else data
+    )
 
     start = index * 64
     end = start + 64
@@ -161,8 +129,8 @@ def format_decimal(
 # RPC CLIENT
 # ============================================================
 
-
 class EVMRPC:
+
     def __init__(
         self,
         rpc_url: str,
@@ -214,7 +182,6 @@ class EVMRPC:
 # ERC20 DECIMALS
 # ============================================================
 
-
 DECIMALS_SELECTOR = "0x313ce567"
 
 
@@ -222,7 +189,9 @@ async def get_token_decimals(
     rpc: EVMRPC,
     token_address: str,
 ) -> int:
+
     try:
+
         result = await rpc.call(
             "eth_call",
             [
@@ -234,16 +203,19 @@ async def get_token_decimals(
             ],
         )
 
-        return int(result, 16)
+        return int(
+            result,
+            16,
+        )
 
     except Exception:
+
         return 18
 
 
 # ============================================================
 # PAIR TOKEN0 / TOKEN1
 # ============================================================
-
 
 TOKEN0_SELECTOR = "0x0dfe1681"
 TOKEN1_SELECTOR = "0xd21220a7"
@@ -254,7 +226,9 @@ async def get_pair_token(
     pair_address: str,
     selector: str,
 ) -> str | None:
+
     try:
+
         result = await rpc.call(
             "eth_call",
             [
@@ -269,9 +243,13 @@ async def get_pair_token(
         if not result:
             return None
 
-        return "0x" + result[-40:].lower()
+        return (
+            "0x"
+            + result[-40:].lower()
+        )
 
     except Exception:
+
         return None
 
 
@@ -279,40 +257,17 @@ async def get_pair_token(
 # CURRENT BLOCK
 # ============================================================
 
-
 async def get_latest_block(
     rpc: EVMRPC,
 ) -> int:
+
     result = await rpc.call(
         "eth_blockNumber",
         [],
     )
 
-    return int(result, 16)
-
-
-# ============================================================
-# BLOCK TIMESTAMP
-# ============================================================
-
-
-async def get_block_timestamp(
-    rpc: EVMRPC,
-    block_number: int,
-) -> int:
-    result = await rpc.call(
-        "eth_getBlockByNumber",
-        [
-            hex(block_number),
-            False,
-        ],
-    )
-
-    if not result:
-        return 0
-
     return int(
-        result.get("timestamp", "0x0"),
+        result,
         16,
     )
 
@@ -321,20 +276,25 @@ async def get_block_timestamp(
 # FETCH SWAP LOGS
 # ============================================================
 
-
 async def get_swap_logs(
     rpc: EVMRPC,
     pair_address: str,
     from_block: int,
     to_block: int,
 ) -> list:
+
     try:
+
         result = await rpc.call(
             "eth_getLogs",
             [
                 {
-                    "fromBlock": hex(from_block),
-                    "toBlock": hex(to_block),
+                    "fromBlock": hex(
+                        from_block
+                    ),
+                    "toBlock": hex(
+                        to_block
+                    ),
                     "address": pair_address,
                     "topics": [
                         SWAP_EVENT_TOPIC
@@ -346,6 +306,7 @@ async def get_swap_logs(
         return result or []
 
     except Exception as exc:
+
         print(
             f"EVM log query failed for "
             f"{pair_address}: {exc}"
@@ -357,7 +318,6 @@ async def get_swap_logs(
 # ============================================================
 # SWAP DECODER
 # ============================================================
-
 
 def decode_swap_log(
     log: dict,
@@ -377,6 +337,7 @@ def decode_swap_log(
         return None
 
     try:
+
         sender = topic_address(
             topics[1]
         )
@@ -432,6 +393,7 @@ def decode_swap_log(
         }
 
     except Exception as exc:
+
         print(
             f"Failed to decode swap: {exc}"
         )
@@ -440,9 +402,8 @@ def decode_swap_log(
 
 
 # ============================================================
-# DETERMINE WHETHER TOKEN WAS BOUGHT
+# DETERMINE BUY
 # ============================================================
-
 
 def determine_trade(
     swap: dict,
@@ -455,46 +416,72 @@ def determine_trade(
         token_address
     )
 
-    token0 = normalize_address(token0)
-    token1 = normalize_address(token1)
+    token0 = normalize_address(
+        token0
+    )
+
+    token1 = normalize_address(
+        token1
+    )
 
     if not token0 or not token1:
         return None
 
     if token_address == token0:
 
-        token_in = swap["amount0_in"]
-        token_out = swap["amount0_out"]
+        token_in = swap[
+            "amount0_in"
+        ]
 
-        quote_in = swap["amount1_in"]
-        quote_out = swap["amount1_out"]
+        token_out = swap[
+            "amount0_out"
+        ]
+
+        quote_in = swap[
+            "amount1_in"
+        ]
+
+        quote_out = swap[
+            "amount1_out"
+        ]
 
         token_side = "token0"
 
     elif token_address == token1:
 
-        token_in = swap["amount1_in"]
-        token_out = swap["amount1_out"]
+        token_in = swap[
+            "amount1_in"
+        ]
 
-        quote_in = swap["amount0_in"]
-        quote_out = swap["amount0_out"]
+        token_out = swap[
+            "amount1_out"
+        ]
+
+        quote_in = swap[
+            "amount0_in"
+        ]
+
+        quote_out = swap[
+            "amount0_out"
+        ]
 
         token_side = "token1"
 
     else:
+
         return None
 
+    #
     # BUY:
     #
-    # User sends quote asset into pair
-    # User receives monitored token.
+    # Quote asset enters the pair.
+    # Monitored token leaves the pair.
     #
-    # Example:
-    #
-    # USDT in
-    # TOKEN out
 
-    if token_out > 0 and quote_in > 0:
+    if (
+        token_out > 0
+        and quote_in > 0
+    ):
 
         return {
             "type": "BUY",
@@ -509,11 +496,11 @@ def determine_trade(
 
 
 # ============================================================
-# DATABASE HELPERS
+# DATABASE — MONITORED TOKENS
 # ============================================================
 
-
 async def get_monitored_tokens():
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -545,6 +532,10 @@ async def get_monitored_tokens():
     return rows
 
 
+# ============================================================
+# DATABASE — LAST BLOCK
+# ============================================================
+
 async def get_last_block(
     chain: str,
 ) -> int | None:
@@ -571,13 +562,16 @@ async def get_last_block(
         return None
 
     try:
+
         return int(
             row["setting_value"]
         )
+
     except (
         TypeError,
         ValueError,
     ):
+
         return None
 
 
@@ -585,6 +579,7 @@ async def save_last_block(
     chain: str,
     block_number: int,
 ):
+
     pool = await get_pool()
 
     key = (
@@ -610,8 +605,8 @@ async def save_last_block(
                 setting_key
             )
             DO UPDATE SET
-                setting_value = EXCLUDED
-                    .setting_value,
+                setting_value =
+                    EXCLUDED.setting_value,
                 updated_at = NOW()
             """,
             key,
@@ -619,6 +614,10 @@ async def save_last_block(
             "BuyBot EVM detector last processed block.",
         )
 
+
+# ============================================================
+# DATABASE — DUPLICATE CHECK
+# ============================================================
 
 async def event_exists(
     group_id: int,
@@ -651,6 +650,10 @@ async def event_exists(
     return row is not None
 
 
+# ============================================================
+# DATABASE — SAVE EVENT
+# ============================================================
+
 async def save_event(
     group_id: int,
     chain: str,
@@ -661,36 +664,14 @@ async def save_event(
     spent_amount_usd: Decimal,
     received_amount: Decimal,
 ):
+
     pool = await get_pool()
 
     async with pool.acquire() as connection:
 
-        try:
-
-            await connection.execute(
-                """
-                INSERT INTO buybot_events (
-                    group_id,
-                    chain,
-                    tx_hash,
-                    token_address,
-                    token_symbol,
-                    buyer_address,
-                    spent_amount_usd,
-                    received_amount
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    $3,
-                    $4,
-                    $5,
-                    $6,
-                    $7,
-                    $8
-                )
-                ON CONFLICT DO NOTHING
-                """,
+        await connection.execute(
+            """
+            INSERT INTO buybot_events (
                 group_id,
                 chain,
                 tx_hash,
@@ -698,298 +679,43 @@ async def save_event(
                 token_symbol,
                 buyer_address,
                 spent_amount_usd,
-                received_amount,
+                received_amount
             )
-
-        except Exception as exc:
-            print(
-                f"Failed saving BuyBot event: "
-                f"{exc}"
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8
             )
-
-
-async def get_buybot_settings(
-    group_id: int,
-):
-    pool = await get_pool()
-
-    async with pool.acquire() as connection:
-
-        row = await connection.fetchrow(
-            """
-            SELECT
-                enabled,
-                min_buy_usd,
-                media_type,
-                media_id,
-                alert_title,
-                alert_template,
-                buy_emoji,
-                new_holder_emoji,
-                market_cap_emoji,
-                spent_emoji,
-                received_emoji,
-                network_emoji
-            FROM buybot_settings
-            WHERE group_id = $1
+            ON CONFLICT DO NOTHING
             """,
             group_id,
+            chain,
+            tx_hash,
+            token_address,
+            token_symbol,
+            buyer_address,
+            spent_amount_usd,
+            received_amount,
         )
-
-    return row
-
-
-async def get_buybot_buttons(
-    group_id: int,
-):
-    pool = await get_pool()
-
-    async with pool.acquire() as connection:
-
-        rows = await connection.fetch(
-            """
-            SELECT
-                button_name,
-                button_url,
-                position
-            FROM buybot_buttons
-            WHERE group_id = $1
-            ORDER BY position ASC, id ASC
-            """,
-            group_id,
-        )
-
-    return rows
-
-
-# ============================================================
-# BUYBOT ALERT BUILDER
-# ============================================================
-
-
-def build_buy_alert(
-    chain: str,
-    token_name: str | None,
-    token_symbol: str | None,
-    spent_usd: Decimal,
-    received_amount: Decimal,
-    buyer: str | None,
-    settings,
-) -> str:
-
-    symbol = (
-        token_symbol
-        or "TOKEN"
-    )
-
-    name = (
-        token_name
-        or symbol
-    )
-
-    title = (
-        settings["alert_title"]
-        if settings
-        and settings["alert_title"]
-        else "⚡ New Buy Detected"
-    )
-
-    buy_emoji = (
-        settings["buy_emoji"]
-        if settings
-        and settings["buy_emoji"]
-        else "🟢"
-    )
-
-    spent_emoji = (
-        settings["spent_emoji"]
-        if settings
-        and settings["spent_emoji"]
-        else "💵"
-    )
-
-    received_emoji = (
-        settings["received_emoji"]
-        if settings
-        and settings["received_emoji"]
-        else "🪙"
-    )
-
-    network_emoji = (
-        settings["network_emoji"]
-        if settings
-        and settings["network_emoji"]
-        else "🌐"
-    )
-
-    short_buyer = (
-        f"{buyer[:6]}..."
-        f"{buyer[-4:]}"
-        if buyer
-        and len(buyer) > 12
-        else buyer
-        or "Unknown"
-    )
-
-    return (
-        f"{title}\n\n"
-        f"{buy_emoji} "
-        f"*{name}* "
-        f"(${symbol})\n\n"
-        f"{spent_emoji} "
-        f"Spent: `${format_decimal(spent_usd, 2)}`\n"
-        f"{received_emoji} "
-        f"Received: "
-        f"`{format_decimal(received_amount, 6)} "
-        f"{symbol}`\n\n"
-        f"{network_emoji} "
-        f"Network: `{chain}`\n"
-        f"👤 Buyer: `{short_buyer}`"
-    )
-
-
-# ============================================================
-# TELEGRAM SENDER
-# ============================================================
-
-
-async def send_buy_alert(
-    group_id: int,
-    text: str,
-    settings,
-    buttons,
-):
-    #
-    # Import here to avoid circular imports during startup.
-    #
-    from telegram import (
-        Bot,
-        InlineKeyboardButton,
-        InlineKeyboardMarkup,
-    )
-
-    from config import BOT_TOKEN
-
-    if not BOT_TOKEN:
-        return
-
-    keyboard = []
-
-    row = []
-
-    for button in buttons:
-
-        row.append(
-            InlineKeyboardButton(
-                text=button["button_name"],
-                url=button["button_url"],
-            )
-        )
-
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-
-    if row:
-        keyboard.append(row)
-
-    reply_markup = (
-        InlineKeyboardMarkup(keyboard)
-        if keyboard
-        else None
-    )
-
-    bot = Bot(
-        token=BOT_TOKEN
-    )
-
-    try:
-
-        media_type = (
-            settings["media_type"]
-            if settings
-            else None
-        )
-
-        media_id = (
-            settings["media_id"]
-            if settings
-            else None
-        )
-
-        if media_type and media_id:
-
-            if media_type == "photo":
-
-                await bot.send_photo(
-                    chat_id=group_id,
-                    photo=media_id,
-                    caption=text,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
-                )
-
-            elif media_type == "video":
-
-                await bot.send_video(
-                    chat_id=group_id,
-                    video=media_id,
-                    caption=text,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
-                )
-
-            elif media_type == "animation":
-
-                await bot.send_animation(
-                    chat_id=group_id,
-                    animation=media_id,
-                    caption=text,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
-                )
-
-            else:
-
-                await bot.send_message(
-                    chat_id=group_id,
-                    text=text,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
-                )
-
-        else:
-
-            await bot.send_message(
-                chat_id=group_id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=reply_markup,
-            )
-
-    except Exception as exc:
-
-        print(
-            f"Failed sending BuyBot alert "
-            f"to {group_id}: {exc}"
-        )
-
-    finally:
-
-        await bot.shutdown()
 
 
 # ============================================================
 # PROCESS ONE SWAP
 # ============================================================
 
-
 async def process_swap(
     chain: str,
-    token: dict,
+    token,
     rpc: EVMRPC,
     swap: dict,
+    token_pair_cache: dict,
 ):
+
     token_address = normalize_address(
         token["contract_address"]
     )
@@ -1004,16 +730,35 @@ async def process_swap(
     if not pair_address:
         return
 
-    token0 = await get_pair_token(
-        rpc,
-        pair_address,
-        TOKEN0_SELECTOR,
-    )
+    #
+    # Cache pair token addresses.
+    #
 
-    token1 = await get_pair_token(
-        rpc,
-        pair_address,
-        TOKEN1_SELECTOR,
+    if pair_address not in token_pair_cache:
+
+        token0 = await get_pair_token(
+            rpc,
+            pair_address,
+            TOKEN0_SELECTOR,
+        )
+
+        token1 = await get_pair_token(
+            rpc,
+            pair_address,
+            TOKEN1_SELECTOR,
+        )
+
+        token_pair_cache[
+            pair_address
+        ] = (
+            token0,
+            token1,
+        )
+
+    token0, token1 = (
+        token_pair_cache[
+            pair_address
+        ]
     )
 
     if not token0 or not token1:
@@ -1048,12 +793,19 @@ async def process_swap(
     ):
         return
 
+    #
+    # Token decimals.
+    #
+
     decimals = await get_token_decimals(
         rpc,
         token_address,
     )
 
-    if decimals < 0 or decimals > 36:
+    if (
+        decimals < 0
+        or decimals > 36
+    ):
         decimals = 18
 
     received_amount = (
@@ -1062,22 +814,12 @@ async def process_swap(
         )
         / (
             Decimal(10)
-            ** Decimal(decimals)
+            ** decimals
         )
     )
 
     #
-    # The quote side may be:
-    #
-    # USDT / USDC
-    # WETH / WBNB
-    # another token
-    #
-    # We need a USD estimate.
-    #
-    # For the first detection layer we calculate the
-    # quote quantity. A later market-data layer will
-    # resolve the exact USD value from DEX Screener.
+    # Determine quote token.
     #
 
     quote_token = (
@@ -1086,23 +828,31 @@ async def process_swap(
         else token0
     )
 
-    quote_decimals = 18
-
     chain_config = CHAIN_CONFIG.get(
         chain,
         {},
     )
 
     stablecoins = {
-        normalize_address(x)
-        for x in chain_config.get(
+        normalize_address(address)
+        for address in chain_config.get(
             "stablecoins",
             set(),
         )
     }
 
+    #
+    # Stablecoins are normally 6 decimals.
+    # Wrapped native assets are normally 18.
+    #
+
     if quote_token in stablecoins:
+
         quote_decimals = 6
+
+    else:
+
+        quote_decimals = 18
 
     quote_amount = (
         Decimal(
@@ -1110,15 +860,41 @@ async def process_swap(
         )
         / (
             Decimal(10)
-            ** Decimal(quote_decimals)
+            ** quote_decimals
         )
     )
 
+    #
+    # For stablecoin pairs this is directly
+    # approximately USD.
+    #
+    # For BNB/ETH/other quote assets this is
+    # the quote quantity for now.
+    #
+    # A later market-data layer will convert
+    # native assets to USD.
+    #
+
     spent_usd = quote_amount
 
-    settings = await get_buybot_settings(
-        group_id
-    )
+    #
+    # Fetch BuyBot settings.
+    #
+
+    pool = await get_pool()
+
+    async with pool.acquire() as connection:
+
+        settings = await connection.fetchrow(
+            """
+            SELECT
+                enabled,
+                min_buy_usd
+            FROM buybot_settings
+            WHERE group_id = $1
+            """,
+            group_id,
+        )
 
     if not settings:
         return
@@ -1126,22 +902,34 @@ async def process_swap(
     if not settings["enabled"]:
         return
 
-    minimum = (
-        Decimal(
+    minimum_buy = Decimal(
+        str(
             settings["min_buy_usd"]
             or 0
         )
     )
 
-    if spent_usd < minimum:
+    if (
+        minimum_buy > 0
+        and spent_usd < minimum_buy
+    ):
         return
+
+    #
+    # Save event before sending the alert.
+    # This prevents duplicate alerts if Telegram
+    # sending succeeds but the worker sees the
+    # same blockchain event again.
+    #
 
     await save_event(
         group_id=group_id,
         chain=chain,
         tx_hash=tx_hash,
         token_address=token_address,
-        token_symbol=token["token_symbol"],
+        token_symbol=token[
+            "token_symbol"
+        ],
         buyer_address=swap.get(
             "buyer"
         ),
@@ -1149,25 +937,53 @@ async def process_swap(
         received_amount=received_amount,
     )
 
-    buttons = await get_buybot_buttons(
-        group_id
-    )
+    #
+    # Send through the central renderer.
+    #
 
-    text = build_buy_alert(
-        chain=chain,
-        token_name=token["token_name"],
-        token_symbol=token["token_symbol"],
-        spent_usd=spent_usd,
-        received_amount=received_amount,
-        buyer=swap.get("buyer"),
-        settings=settings,
-    )
+    try:
 
-    await send_buy_alert(
-        group_id=group_id,
-        text=text,
-        settings=settings,
-        buttons=buttons,
+        await send_buy_alert(
+            bot=None,
+            group_id=group_id,
+            chain=chain,
+            token_address=token_address,
+            token_name=token[
+                "token_name"
+            ],
+            token_symbol=token[
+                "token_symbol"
+            ],
+            buyer_address=swap.get(
+                "buyer"
+            ),
+            spent_amount_usd=spent_usd,
+            received_amount=received_amount,
+            tx_hash=tx_hash,
+            market_cap_usd=None,
+            dex_url=token[
+                "dex_url"
+            ],
+            trending_url=None,
+        )
+
+    except Exception as exc:
+
+        print(
+            f"Failed sending EVM BuyBot "
+            f"alert for {tx_hash}: {exc}"
+        )
+
+    print(
+        "EVM BUY DETECTED | "
+        f"chain={chain} | "
+        f"group={group_id} | "
+        f"token="
+        f"{token['token_symbol']} | "
+        f"spent={spent_usd} | "
+        f"received={received_amount} | "
+        f"buyer={swap.get('buyer')} | "
+        f"tx={tx_hash}"
     )
 
 
@@ -1175,10 +991,10 @@ async def process_swap(
 # PROCESS CHAIN
 # ============================================================
 
-
 async def process_chain(
     chain: str,
 ):
+
     config = CHAIN_CONFIG.get(
         chain
     )
@@ -1191,6 +1007,7 @@ async def process_chain(
     )
 
     if not rpc_url:
+
         print(
             f"No RPC configured for {chain}."
         )
@@ -1222,10 +1039,6 @@ async def process_chain(
 
     if last_block is None:
 
-        #
-        # Start close to the current head
-        # instead of scanning the entire chain.
-        #
         last_block = max(
             0,
             latest_block - 2,
@@ -1234,7 +1047,9 @@ async def process_chain(
     if last_block >= latest_block:
         return
 
-    start_block = last_block + 1
+    start_block = (
+        last_block + 1
+    )
 
     end_block = min(
         latest_block,
@@ -1249,46 +1064,7 @@ async def process_chain(
         f"{start_block}-{end_block}"
     )
 
-    #
-    # Cache token0/token1 per pair for this batch.
-    #
-
     pair_cache = {}
-
-    for token in chain_tokens:
-
-        pair_address = normalize_address(
-            token["pair_address"]
-        )
-
-        if not pair_address:
-            continue
-
-        if pair_address not in pair_cache:
-
-            token0 = await get_pair_token(
-                rpc,
-                pair_address,
-                TOKEN0_SELECTOR,
-            )
-
-            token1 = await get_pair_token(
-                rpc,
-                pair_address,
-                TOKEN1_SELECTOR,
-            )
-
-            pair_cache[pair_address] = (
-                token0,
-                token1,
-            )
-
-    #
-    # Query each pair separately.
-    #
-    # This keeps the system compatible with public
-    # RPC providers that impose log-filter limits.
-    #
 
     for token in chain_tokens:
 
@@ -1325,6 +1101,7 @@ async def process_chain(
                     token=token,
                     rpc=rpc,
                     swap=swap,
+                    token_pair_cache=pair_cache,
                 )
 
             except Exception as exc:
@@ -1341,13 +1118,13 @@ async def process_chain(
 
 
 # ============================================================
-# CHAIN WORKERS
+# CHAIN WORKER
 # ============================================================
-
 
 async def evm_chain_loop(
     chain: str,
 ):
+
     print(
         f"{chain} BuyBot detector "
         f"started."
@@ -1386,8 +1163,8 @@ async def evm_chain_loop(
 # MAIN EVM WORKER
 # ============================================================
 
-
 async def evm_detector_worker():
+
     print(
         "EVM BuyBot detector worker "
         "started."
