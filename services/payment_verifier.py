@@ -1,48 +1,55 @@
 import asyncio
 from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, Optional
 
 import httpx
 
 from config import (
+    BNB_RPC_URL,
+    ETHEREUM_RPC_URL,
     ETHERSCAN_API_KEY,
     HELIUS_API_KEY,
+    ROBINHOOD_RPC_URL,
 )
 
 from database.connection import get_pool
 
 
-ETHERSCAN_V2_URL = (
-    "https://api.etherscan.io/v2/api"
-)
+# ============================================================
+# PAYMENT CONFIGURATION
+# ============================================================
 
-HELIUS_RPC_URL = (
-    "https://mainnet.helius-rpc.com/"
-)
+ETHEREUM_USDT_CONTRACT = (
+    "0xdac17f958d2ee523a2206206994597c13d831ec7"
+).lower()
 
-ETHEREUM_CHAIN_ID = 1
-BNB_CHAIN_ID = 56
+BNB_USDT_CONTRACT = (
+    "0x55d398326f99059ff775485246999027b3197955"
+).lower()
 
-EVM_CONFIRMATIONS_REQUIRED = 3
-
-USDT_CONTRACTS = {
-    "ethereum": (
-        "0xdac17f958d2ee523a2206206994597c13d831ec7"
-    ),
-    "bnb": (
-        "0x55d398326f99059ff775485246999027b3197955"
-    ),
-}
-
+# Official USDT SPL mint on Solana.
 SOLANA_USDT_MINT = (
-    "es9vmfrzacer m jfrf4h2fyd4kco"
-    "nk11mcce8benwnyb"
-    .replace(" ", "")
-    .lower()
-)
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+).lower()
 
 
-def normalize_chain(chain):
-    chain = (
+EVM_DECIMALS = 6
+SOLANA_DECIMALS = 6
+
+DEFAULT_CONFIRMATIONS = 3
+DEFAULT_TOLERANCE_USDT = Decimal("0.10")
+
+HTTP_TIMEOUT = 20.0
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def normalize_chain(
+    chain: str,
+) -> str:
+    value = (
         str(chain or "")
         .strip()
         .lower()
@@ -51,42 +58,66 @@ def normalize_chain(chain):
     aliases = {
         "bsc": "bnb",
         "binance": "bnb",
-        "binance-smart-chain": "bnb",
+        "binance smart chain": "bnb",
+        "bnb smart chain": "bnb",
         "eth": "ethereum",
         "mainnet": "ethereum",
         "sol": "solana",
+        "rh": "robinhood",
+        "robinhood chain": "robinhood",
     }
 
     return aliases.get(
-        chain,
-        chain,
+        value,
+        value,
     )
 
 
-def decimal_from_raw(
-    raw_value,
-    decimals,
-):
+def normalize_address(
+    address: Optional[str],
+) -> str:
+    return (
+        str(address or "")
+        .strip()
+        .lower()
+    )
+
+
+def decimal_value(
+    value: Any,
+) -> Optional[Decimal]:
+    if value is None:
+        return None
+
     try:
-        return (
-            Decimal(str(raw_value))
-            / (
-                Decimal(10)
-                ** int(decimals)
-            )
+        return Decimal(
+            str(value)
         )
     except (
         InvalidOperation,
         ValueError,
         TypeError,
     ):
-        return Decimal("0")
+        return None
 
+
+def within_tolerance(
+    actual: Decimal,
+    expected: Decimal,
+    tolerance: Decimal,
+) -> bool:
+    return abs(
+        actual - expected
+    ) <= tolerance
+
+
+# ============================================================
+# SYSTEM SETTINGS
+# ============================================================
 
 async def get_system_setting(
-    key,
-    default=None,
-):
+    key: str,
+) -> Optional[str]:
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -100,40 +131,41 @@ async def get_system_setting(
             key,
         )
 
-        if not row:
-            return default
+    if not row:
+        return None
 
-        return row["value"]
+    return row["value"]
 
 
-async def get_payment_tolerance():
+async def get_payment_tolerance() -> Decimal:
     value = await get_system_setting(
-        "payment_tolerance_usdt",
-        "0.10",
+        "payment_tolerance_usdt"
     )
 
-    try:
-        tolerance = Decimal(
-            str(value)
-        )
-    except (
-        InvalidOperation,
-        ValueError,
-        TypeError,
-    ):
-        tolerance = Decimal("0.10")
+    parsed = decimal_value(
+        value
+    )
 
-    if tolerance < 0:
-        tolerance = Decimal("0.10")
+    if parsed is None:
+        return DEFAULT_TOLERANCE_USDT
 
-    return tolerance
+    if parsed < 0:
+        return DEFAULT_TOLERANCE_USDT
+
+    return parsed
 
 
-async def get_order(order_id):
+# ============================================================
+# ORDER LOOKUP
+# ============================================================
+
+async def get_order_for_payment(
+    order_id: str,
+):
     pool = await get_pool()
 
     async with pool.acquire() as connection:
-        return await connection.fetchrow(
+        row = await connection.fetchrow(
             """
             SELECT
                 id,
@@ -161,10 +193,16 @@ async def get_order(order_id):
             order_id,
         )
 
+    return row
 
-async def is_tx_hash_used(
-    tx_hash,
-):
+
+# ============================================================
+# DUPLICATE TRANSACTION PROTECTION
+# ============================================================
+
+async def transaction_hash_used(
+    transaction_hash: str,
+) -> bool:
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -175,16 +213,16 @@ async def is_tx_hash_used(
             WHERE transaction_hash = $1
             LIMIT 1;
             """,
-            tx_hash,
+            transaction_hash.strip(),
         )
 
-        return row is not None
+    return row is not None
 
 
-async def reserve_tx_hash(
-    tx_hash,
-    order_id,
-):
+async def reserve_transaction_hash(
+    transaction_hash: str,
+    order_id: str,
+) -> bool:
     pool = await get_pool()
 
     async with pool.acquire() as connection:
@@ -197,594 +235,36 @@ async def reserve_tx_hash(
                 )
                 VALUES ($1, $2);
                 """,
-                tx_hash,
+                transaction_hash.strip(),
                 order_id,
             )
-
             return True
 
-        except Exception:
-            return False
+        except Exception as exc:
+            message = str(exc).lower()
+
+            if (
+                "duplicate"
+                in message
+                or "unique"
+                in message
+            ):
+                return False
+
+            raise
 
 
-async def release_tx_hash(
-    tx_hash,
-):
-    pool = await get_pool()
+# ============================================================
+# RPC HELPERS
+# ============================================================
 
-    async with pool.acquire() as connection:
-        await connection.execute(
-            """
-            DELETE FROM used_payment_hashes
-            WHERE transaction_hash = $1;
-            """,
-            tx_hash,
-        )
-
-
-async def get_evm_tx_data(
-    chain,
-    tx_hash,
-):
-    if not ETHERSCAN_API_KEY:
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                "Etherscan API key is not configured."
-            ),
-        }
-
-    chain = normalize_chain(chain)
-
-    if chain == "ethereum":
-        chain_id = ETHEREUM_CHAIN_ID
-
-    elif chain == "bnb":
-        chain_id = BNB_CHAIN_ID
-
-    else:
-        return {
-            "ok": False,
-            "pending": False,
-            "reason": "Unsupported EVM payment chain.",
-        }
-
-    params = {
-        "chainid": chain_id,
-        "module": "account",
-        "action": "tokentx",
-        "contractaddress": USDT_CONTRACTS[
-            chain
-        ],
-        "txhash": tx_hash,
-        "page": 1,
-        "offset": 100,
-        "sort": "desc",
-        "apikey": ETHERSCAN_API_KEY,
-    }
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=20
-        ) as client:
-            response = await client.get(
-                ETHERSCAN_V2_URL,
-                params=params,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-    except Exception as exc:
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                "Unable to query Etherscan: "
-                f"{exc}"
-            ),
-        }
-
-    status = str(
-        data.get("status", "")
-    )
-
-    message = str(
-        data.get("message", "")
-    )
-
-    result = data.get(
-        "result"
-    )
-
-    if status == "0":
-        result_text = str(
-            result or ""
-        ).lower()
-
-        if (
-            "no transactions found"
-            in result_text
-            or "not found"
-            in result_text
-        ):
-            return {
-                "ok": False,
-                "pending": True,
-                "reason": (
-                    "Transaction was not found "
-                    "yet."
-                ),
-            }
-
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                f"Etherscan response: "
-                f"{message or result}"
-            ),
-        }
-
-    if not isinstance(
-        result,
-        list,
-    ):
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                "No token transfer data "
-                "is available yet."
-            ),
-        }
-
-    transfers = []
-
-    for transfer in result:
-        transfer_hash = str(
-            transfer.get("hash", "")
-        ).lower()
-
-        if transfer_hash == tx_hash.lower():
-            transfers.append(
-                transfer
-            )
-
-    if not transfers:
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                "No matching USDT transfer "
-                "was found yet."
-            ),
-        }
-
-    return {
-        "ok": True,
-        "pending": False,
-        "transfers": transfers,
-        "raw": data,
-    }
-
-
-async def get_evm_receipt(
-    chain,
-    tx_hash,
-):
-    rpc_url = None
-
-    if chain == "ethereum":
-        rpc_url = (
-            "https://ethereum-rpc.publicnode.com"
-        )
-
-    elif chain == "bnb":
-        rpc_url = (
-            "https://bsc-rpc.publicnode.com"
-        )
-
+async def rpc_call(
+    rpc_url: str,
+    method: str,
+    params: list,
+) -> Optional[Dict[str, Any]]:
     if not rpc_url:
-        return {
-            "ok": False,
-            "pending": False,
-            "reason": "Unsupported EVM chain.",
-        }
-
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_getTransactionReceipt",
-        "params": [
-            tx_hash
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=20
-        ) as client:
-            response = await client.post(
-                rpc_url,
-                json=payload,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-    except Exception as exc:
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                "Unable to query transaction "
-                f"receipt: {exc}"
-            ),
-        }
-
-    receipt = data.get(
-        "result"
-    )
-
-    if receipt is None:
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                "Transaction has not been "
-                "mined yet."
-            ),
-        }
-
-    status = receipt.get(
-        "status"
-    )
-
-    if status == "0x0":
-        return {
-            "ok": False,
-            "pending": False,
-            "reason": (
-                "Transaction failed on-chain."
-            ),
-        }
-
-    return {
-        "ok": True,
-        "pending": False,
-        "receipt": receipt,
-    }
-
-
-async def get_evm_block_number(
-    chain,
-):
-    if chain == "ethereum":
-        rpc_url = (
-            "https://ethereum-rpc.publicnode.com"
-        )
-
-    elif chain == "bnb":
-        rpc_url = (
-            "https://bsc-rpc.publicnode.com"
-        )
-
-    else:
         return None
-
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_blockNumber",
-        "params": [],
-    }
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=20
-        ) as client:
-            response = await client.post(
-                rpc_url,
-                json=payload,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            result = data.get(
-                "result"
-            )
-
-            if not result:
-                return None
-
-            return int(
-                result,
-                16,
-            )
-
-    except Exception as exc:
-        print(
-            "EVM block-number error: "
-            f"{exc}"
-        )
-
-        return None
-
-
-async def verify_evm_payment(
-    order,
-    tx_hash,
-):
-    chain = normalize_chain(
-        order["chain"]
-    )
-
-    expected_wallet = str(
-        order["payment_wallet"] or ""
-    ).lower()
-
-    if not expected_wallet:
-        return {
-            "valid": False,
-            "pending": False,
-            "reason": (
-                "Payment wallet is not configured "
-                "for this order."
-            ),
-        }
-
-    expected_amount = Decimal(
-        str(order["amount"])
-    )
-
-    transfer_result = (
-        await get_evm_tx_data(
-            chain,
-            tx_hash,
-        )
-    )
-
-    if transfer_result.get(
-        "pending"
-    ):
-        return {
-            "valid": False,
-            "pending": True,
-            "reason": transfer_result.get(
-                "reason"
-            ),
-        }
-
-    if not transfer_result.get(
-        "ok"
-    ):
-        return {
-            "valid": False,
-            "pending": False,
-            "reason": transfer_result.get(
-                "reason",
-                "Unable to verify payment.",
-            ),
-        }
-
-    transfers = transfer_result[
-        "transfers"
-    ]
-
-    expected_contract = (
-        USDT_CONTRACTS[chain]
-    )
-
-    tolerance = (
-        await get_payment_tolerance()
-    )
-
-    matching_transfer = None
-
-    for transfer in transfers:
-        contract = str(
-            transfer.get(
-                "contractAddress",
-                "",
-            )
-        ).lower()
-
-        to_address = str(
-            transfer.get(
-                "to",
-                "",
-            )
-        ).lower()
-
-        if contract != expected_contract:
-            continue
-
-        if to_address != expected_wallet:
-            continue
-
-        try:
-            decimals = int(
-                transfer.get(
-                    "tokenDecimal",
-                    6,
-                )
-            )
-
-            amount = decimal_from_raw(
-                transfer.get(
-                    "value",
-                    "0",
-                ),
-                decimals,
-            )
-
-        except Exception:
-            continue
-
-        difference = abs(
-            amount - expected_amount
-        )
-
-        if difference <= tolerance:
-            matching_transfer = {
-                "amount": amount,
-                "block_number": int(
-                    transfer.get(
-                        "blockNumber",
-                        "0",
-                    )
-                ),
-                "from": transfer.get(
-                    "from"
-                ),
-                "to": to_address,
-                "contract": contract,
-            }
-
-            break
-
-    if not matching_transfer:
-        return {
-            "valid": False,
-            "pending": False,
-            "reason": (
-                "No USDT transfer matching "
-                "the required amount and "
-                "payment wallet was found."
-            ),
-        }
-
-    receipt_result = (
-        await get_evm_receipt(
-            chain,
-            tx_hash,
-        )
-    )
-
-    if receipt_result.get(
-        "pending"
-    ):
-        return {
-            "valid": False,
-            "pending": True,
-            "reason": receipt_result.get(
-                "reason"
-            ),
-        }
-
-    if not receipt_result.get(
-        "ok"
-    ):
-        return {
-            "valid": False,
-            "pending": False,
-            "reason": receipt_result.get(
-                "reason"
-            ),
-        }
-
-    receipt = receipt_result[
-        "receipt"
-    ]
-
-    receipt_block_hex = receipt.get(
-        "blockNumber"
-    )
-
-    if not receipt_block_hex:
-        return {
-            "valid": False,
-            "pending": True,
-            "reason": (
-                "Transaction block is not "
-                "available yet."
-            ),
-        }
-
-    receipt_block = int(
-        receipt_block_hex,
-        16,
-    )
-
-    current_block = (
-        await get_evm_block_number(
-            chain
-        )
-    )
-
-    if current_block is None:
-        return {
-            "valid": False,
-            "pending": True,
-            "reason": (
-                "Unable to determine "
-                "confirmation count."
-            ),
-        }
-
-    confirmations = (
-        current_block
-        - receipt_block
-        + 1
-    )
-
-    if (
-        confirmations
-        < EVM_CONFIRMATIONS_REQUIRED
-    ):
-        return {
-            "valid": False,
-            "pending": True,
-            "reason": (
-                f"Waiting for confirmations "
-                f"({confirmations}/"
-                f"{EVM_CONFIRMATIONS_REQUIRED})."
-            ),
-        }
-
-    return {
-        "valid": True,
-        "pending": False,
-        "amount": matching_transfer[
-            "amount"
-        ],
-        "confirmations": confirmations,
-        "block_number": receipt_block,
-        "from": matching_transfer[
-            "from"
-        ],
-        "to": matching_transfer[
-            "to"
-        ],
-        "contract": matching_transfer[
-            "contract"
-        ],
-    }
-
-
-async def helius_request(
-    method,
-    params,
-):
-    if not HELIUS_API_KEY:
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                "Helius API key is not configured."
-            ),
-        }
-
-    url = (
-        f"{HELIUS_RPC_URL}"
-        f"?api-key={HELIUS_API_KEY}"
-    )
 
     payload = {
         "jsonrpc": "2.0",
@@ -795,7 +275,471 @@ async def helius_request(
 
     try:
         async with httpx.AsyncClient(
-            timeout=30
+            timeout=HTTP_TIMEOUT
+        ) as client:
+            response = await client.post(
+                rpc_url,
+                json=payload,
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+    except Exception as exc:
+        print(
+            f"RPC request error "
+            f"method={method}: {exc}"
+        )
+        return None
+
+    if data.get("error"):
+        print(
+            f"RPC returned error "
+            f"method={method}: "
+            f"{data['error']}"
+        )
+        return None
+
+    return data
+
+
+# ============================================================
+# EVM RECEIPT
+# ============================================================
+
+async def get_evm_receipt(
+    rpc_url: str,
+    transaction_hash: str,
+) -> Optional[Dict[str, Any]]:
+    result = await rpc_call(
+        rpc_url,
+        "eth_getTransactionReceipt",
+        [transaction_hash],
+    )
+
+    if not result:
+        return None
+
+    return result.get(
+        "result"
+    )
+
+
+async def get_evm_block_number(
+    rpc_url: str,
+) -> Optional[int]:
+    result = await rpc_call(
+        rpc_url,
+        "eth_blockNumber",
+        [],
+    )
+
+    if not result:
+        return None
+
+    value = result.get(
+        "result"
+    )
+
+    if not value:
+        return None
+
+    try:
+        return int(
+            value,
+            16,
+        )
+    except (
+        ValueError,
+        TypeError,
+    ):
+        return None
+
+
+# ============================================================
+# ETHERSCAN TOKEN TRANSFERS
+# ============================================================
+
+async def get_etherscan_token_transfers(
+    chain_id: int,
+    transaction_hash: str,
+) -> Optional[list]:
+    if not ETHERSCAN_API_KEY:
+        return None
+
+    url = (
+        "https://api.etherscan.io/v2/api"
+    )
+
+    params = {
+        "chainid": str(chain_id),
+        "module": "account",
+        "action": "tokentx",
+        "txhash": transaction_hash,
+        "apikey": ETHERSCAN_API_KEY,
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT
+        ) as client:
+            response = await client.get(
+                url,
+                params=params,
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+    except Exception as exc:
+        print(
+            "Etherscan token transfer "
+            f"request error: {exc}"
+        )
+        return None
+
+    result = data.get(
+        "result"
+    )
+
+    if not isinstance(
+        result,
+        list,
+    ):
+        return []
+
+    return result
+
+
+# ============================================================
+# EVM PAYMENT VERIFICATION
+# ============================================================
+
+async def verify_evm_payment(
+    order,
+    transaction_hash: str,
+    chain: str,
+) -> Dict[str, Any]:
+    if chain == "bnb":
+        rpc_url = BNB_RPC_URL
+        chain_id = 56
+        expected_token = BNB_USDT_CONTRACT
+
+    elif chain == "ethereum":
+        rpc_url = ETHEREUM_RPC_URL
+        chain_id = 1
+        expected_token = (
+            ETHEREUM_USDT_CONTRACT
+        )
+
+    else:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Unsupported EVM payment chain."
+            ),
+        }
+
+    payment_wallet = normalize_address(
+        order["payment_wallet"]
+    )
+
+    if not payment_wallet:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Payment wallet is not configured."
+            ),
+        }
+
+    transaction_hash = (
+        transaction_hash.strip()
+    )
+
+    if await transaction_hash_used(
+        transaction_hash
+    ):
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "This transaction hash "
+                "has already been used."
+            ),
+        }
+
+    receipt = await get_evm_receipt(
+        rpc_url,
+        transaction_hash,
+    )
+
+    if receipt is None:
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                "Transaction has not "
+                "been confirmed on-chain yet."
+            ),
+        }
+
+    receipt_status = receipt.get(
+        "status"
+    )
+
+    if receipt_status != "0x1":
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "The blockchain transaction "
+                "failed."
+            ),
+        }
+
+    transfers = (
+        await get_etherscan_token_transfers(
+            chain_id,
+            transaction_hash,
+        )
+    )
+
+    if transfers is None:
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                "Unable to retrieve token "
+                "transfer information yet."
+            ),
+        }
+
+    expected_amount = decimal_value(
+        order["amount"]
+    )
+
+    if expected_amount is None:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Invalid order payment amount."
+            ),
+        }
+
+    tolerance = (
+        await get_payment_tolerance()
+    )
+
+    matching_transfer = None
+
+    for transfer in transfers:
+        token_address = normalize_address(
+            transfer.get(
+                "contractAddress"
+            )
+        )
+
+        if token_address != expected_token:
+            continue
+
+        to_address = normalize_address(
+            transfer.get("to")
+        )
+
+        if to_address != payment_wallet:
+            continue
+
+        decimals = int(
+            transfer.get(
+                "tokenDecimal",
+                EVM_DECIMALS,
+            )
+            or EVM_DECIMALS
+        )
+
+        raw_value = transfer.get(
+            "value"
+        )
+
+        if raw_value is None:
+            continue
+
+        try:
+            actual_amount = (
+                Decimal(str(raw_value))
+                / (
+                    Decimal(10)
+                    ** decimals
+                )
+            )
+        except (
+            InvalidOperation,
+            ValueError,
+        ):
+            continue
+
+        if not within_tolerance(
+            actual_amount,
+            expected_amount,
+            tolerance,
+        ):
+            continue
+
+        matching_transfer = {
+            "amount": actual_amount,
+            "from": transfer.get(
+                "from"
+            ),
+            "to": transfer.get(
+                "to"
+            ),
+            "token": token_address,
+        }
+        break
+
+    if matching_transfer is None:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "No matching USDT transfer "
+                "to the configured payment "
+                "wallet was found."
+            ),
+        }
+
+    latest_block = (
+        await get_evm_block_number(
+            rpc_url
+        )
+    )
+
+    transaction_block = receipt.get(
+        "blockNumber"
+    )
+
+    if (
+        latest_block is None
+        or transaction_block is None
+    ):
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                "Waiting for blockchain "
+                "confirmation information."
+            ),
+        }
+
+    try:
+        transaction_block_number = int(
+            transaction_block,
+            16,
+        )
+    except (
+        ValueError,
+        TypeError,
+    ):
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                "Unable to determine "
+                "transaction confirmation."
+            ),
+        }
+
+    confirmations = (
+        latest_block
+        - transaction_block_number
+        + 1
+    )
+
+    if confirmations < DEFAULT_CONFIRMATIONS:
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                f"Waiting for confirmations "
+                f"({confirmations}/"
+                f"{DEFAULT_CONFIRMATIONS})."
+            ),
+        }
+
+    reserved = (
+        await reserve_transaction_hash(
+            transaction_hash,
+            order["order_id"],
+        )
+    )
+
+    if not reserved:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "This transaction hash "
+                "has already been used."
+            ),
+        }
+
+    return {
+        "valid": True,
+        "pending": False,
+        "amount": matching_transfer[
+            "amount"
+        ],
+        "confirmations": confirmations,
+        "from": matching_transfer[
+            "from"
+        ],
+        "to": matching_transfer[
+            "to"
+        ],
+        "token": matching_transfer[
+            "token"
+        ],
+    }
+
+
+# ============================================================
+# HELIUS SOLANA TRANSACTION
+# ============================================================
+
+async def get_helius_transaction(
+    transaction_hash: str,
+) -> Optional[Dict[str, Any]]:
+    if not HELIUS_API_KEY:
+        return None
+
+    url = (
+        "https://api-mainnet.helius-rpc.com/"
+        "?api-key="
+        f"{HELIUS_API_KEY}"
+    )
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            transaction_hash,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "finalized",
+                "maxSupportedTransactionVersion": 0,
+            },
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT
         ) as client:
             response = await client.post(
                 url,
@@ -807,46 +751,128 @@ async def helius_request(
             data = response.json()
 
     except Exception as exc:
-        return {
-            "ok": False,
-            "pending": True,
-            "reason": (
-                "Helius request failed: "
-                f"{exc}"
-            ),
-        }
+        print(
+            "Helius transaction request "
+            f"error: {exc}"
+        )
+        return None
 
     if data.get("error"):
+        print(
+            "Helius transaction error: "
+            f"{data['error']}"
+        )
+        return None
+
+    return data.get(
+        "result"
+    )
+
+
+# ============================================================
+# SOLANA PAYMENT VERIFICATION
+# ============================================================
+
+async def verify_solana_payment(
+    order,
+    transaction_hash: str,
+) -> Dict[str, Any]:
+    if not HELIUS_API_KEY:
         return {
-            "ok": False,
-            "pending": True,
-            "reason": str(
-                data["error"]
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Solana payment verification "
+                "is not configured."
             ),
         }
 
-    return {
-        "ok": True,
-        "pending": False,
-        "result": data.get(
-            "result"
-        ),
-    }
+    payment_wallet = (
+        order["payment_wallet"]
+        or ""
+    ).strip()
 
+    if not payment_wallet:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Solana payment wallet "
+                "is not configured."
+            ),
+        }
 
-def find_solana_usdt_transfer(
-    transaction,
-    expected_wallet,
-    expected_amount,
-):
+    transaction_hash = (
+        transaction_hash.strip()
+    )
+
+    if await transaction_hash_used(
+        transaction_hash
+    ):
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "This transaction hash "
+                "has already been used."
+            ),
+        }
+
+    transaction = (
+        await get_helius_transaction(
+            transaction_hash
+        )
+    )
+
+    if transaction is None:
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                "Transaction has not reached "
+                "finalized status yet."
+            ),
+        }
+
     meta = transaction.get(
         "meta"
-    ) or {}
+    )
 
-    if meta.get(
-        "err"
-    ) is not None:
-        return None
+    if not meta:
+        return {
+            "valid": False,
+            "pending": True,
+            "reason": (
+                "Transaction metadata is "
+                "not available yet."
+            ),
+        }
+
+    if meta.get("err") is not None:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "The Solana transaction failed."
+            ),
+        }
+
+    expected_amount = decimal_value(
+        order["amount"]
+    )
+
+    if expected_amount is None:
+        return {
+            "valid": False,
+            "pending": False,
+            "reason": (
+                "Invalid order payment amount."
+            ),
+        }
+
+    tolerance = (
+        await get_payment_tolerance()
+    )
 
     pre_balances = (
         meta.get(
@@ -862,226 +888,203 @@ def find_solana_usdt_transfer(
         or []
     )
 
-    pre_map = {}
-    post_map = {}
+    pre_by_account = {}
 
-    for item in pre_balances:
-        if str(
-            item.get("mint", "")
-        ).lower() != SOLANA_USDT_MINT:
-            continue
-
-        key = (
-            item.get(
-                "accountIndex"
-            ),
-            item.get(
-                "owner"
-            ),
+    for balance in pre_balances:
+        account_index = balance.get(
+            "accountIndex"
         )
 
-        pre_map[key] = item
-
-    for item in post_balances:
-        if str(
-            item.get("mint", "")
-        ).lower() != SOLANA_USDT_MINT:
+        if account_index is None:
             continue
 
-        key = (
-            item.get(
-                "accountIndex"
-            ),
-            item.get(
-                "owner"
-            ),
+        pre_by_account[
+            account_index
+        ] = balance
+
+    matching_amount = Decimal("0")
+    sender_owner = None
+
+    for post in post_balances:
+        mint = (
+            str(
+                post.get("mint")
+                or ""
+            )
+            .strip()
+            .lower()
         )
 
-        post_map[key] = item
+        if mint != SOLANA_USDT_MINT:
+            continue
 
-    candidates = []
+        owner = (
+            str(
+                post.get("owner")
+                or ""
+            ).strip()
+        )
 
-    for key, post in post_map.items():
-        owner = str(
+        if owner != payment_wallet:
+            continue
+
+        account_index = post.get(
+            "accountIndex"
+        )
+
+        post_amount_data = (
             post.get(
-                "owner",
-                "",
+                "uiTokenAmount"
+            )
+            or {}
+        )
+
+        post_amount = decimal_value(
+            post_amount_data.get(
+                "uiAmountString"
             )
         )
 
-        if owner.lower() != expected_wallet.lower():
-            continue
+        if post_amount is None:
+            raw_post = (
+                post_amount_data.get(
+                    "amount"
+                )
+            )
 
-        pre = pre_map.get(
-            key
-        )
+            if raw_post is not None:
+                post_amount = (
+                    Decimal(str(raw_post))
+                    / (
+                        Decimal(10)
+                        ** SOLANA_DECIMALS
+                    )
+                )
+
+        if post_amount is None:
+            continue
 
         pre_amount = Decimal("0")
-        post_amount = Decimal("0")
 
-        if pre:
-            pre_amount = Decimal(
-                str(
-                    (
-                        pre.get(
-                            "uiTokenAmount"
+        if account_index in pre_by_account:
+            pre = pre_by_account[
+                account_index
+            ]
+
+            pre_amount_data = (
+                pre.get(
+                    "uiTokenAmount"
+                )
+                or {}
+            )
+
+            pre_amount = decimal_value(
+                pre_amount_data.get(
+                    "uiAmountString"
+                )
+            )
+
+            if pre_amount is None:
+                raw_pre = (
+                    pre_amount_data.get(
+                        "amount"
+                    )
+                )
+
+                if raw_pre is not None:
+                    pre_amount = (
+                        Decimal(
+                            str(raw_pre)
                         )
-                        or {}
-                    ).get(
-                        "uiAmountString",
-                        "0",
+                        / (
+                            Decimal(10)
+                            ** SOLANA_DECIMALS
+                        )
                     )
-                )
-            )
-
-        post_amount = Decimal(
-            str(
-                (
-                    post.get(
-                        "uiTokenAmount"
-                    )
-                    or {}
-                ).get(
-                    "uiAmountString",
-                    "0",
-                )
-            )
-        )
 
         increase = (
             post_amount
             - pre_amount
         )
 
-        if increase <= 0:
-            continue
+        if increase > 0:
+            matching_amount += increase
 
-        difference = abs(
-            increase
-            - expected_amount
-        )
+            if sender_owner is None:
+                sender_owner = (
+                    pre.get("owner")
+                    if account_index
+                    in pre_by_account
+                    else None
+                )
 
-        if difference <= Decimal(
-            "0.10"
-        ):
-            candidates.append(
-                increase
-            )
-
-    if not candidates:
-        return None
-
-    return max(candidates)
-
-
-async def verify_solana_payment(
-    order,
-    tx_hash,
-):
-    expected_wallet = str(
-        order["payment_wallet"] or ""
-    )
-
-    if not expected_wallet:
+    if matching_amount <= 0:
         return {
             "valid": False,
             "pending": False,
             "reason": (
-                "Solana payment wallet is "
-                "not configured."
+                "No USDT transfer to the "
+                "configured Solana payment "
+                "wallet was found."
             ),
         }
 
-    expected_amount = Decimal(
-        str(order["amount"])
-    )
-
-    result = await helius_request(
-        "getTransaction",
-        [
-            tx_hash,
-            {
-                "encoding": "jsonParsed",
-                "commitment": "finalized",
-                "maxSupportedTransactionVersion": 0,
-            },
-        ],
-    )
-
-    if result.get(
-        "pending"
+    if not within_tolerance(
+        matching_amount,
+        expected_amount,
+        tolerance,
     ):
         return {
             "valid": False,
-            "pending": True,
-            "reason": result.get(
-                "reason"
-            ),
-        }
-
-    transaction = result.get(
-        "result"
-    )
-
-    if transaction is None:
-        return {
-            "valid": False,
-            "pending": True,
+            "pending": False,
             "reason": (
-                "Solana transaction was "
-                "not found yet."
+                "The received USDT amount "
+                "does not match the order."
             ),
         }
 
-    received = find_solana_usdt_transfer(
-        transaction,
-        expected_wallet,
-        expected_amount,
+    reserved = (
+        await reserve_transaction_hash(
+            transaction_hash,
+            order["order_id"],
+        )
     )
 
-    if received is None:
-        meta = transaction.get(
-            "meta"
-        ) or {}
-
-        if meta.get(
-            "err"
-        ) is not None:
-            return {
-                "valid": False,
-                "pending": False,
-                "reason": (
-                    "Solana transaction failed."
-                ),
-            }
-
+    if not reserved:
         return {
             "valid": False,
             "pending": False,
             "reason": (
-                "No matching USDT transfer "
-                "to the configured Solana "
-                "payment wallet was found."
+                "This transaction hash "
+                "has already been used."
             ),
         }
 
     return {
         "valid": True,
         "pending": False,
-        "amount": received,
+        "amount": matching_amount,
         "confirmations": "finalized",
+        "from": sender_owner,
+        "to": payment_wallet,
+        "token": SOLANA_USDT_MINT,
     }
 
 
-async def verify_payment(
-    order_id,
-    tx_hash,
-):
-    tx_hash = str(
-        tx_hash or ""
-    ).strip()
+# ============================================================
+# MAIN VERIFICATION ENTRY POINT
+# ============================================================
 
-    if not tx_hash:
+async def verify_payment(
+    order_id: str,
+    transaction_hash: str,
+) -> Dict[str, Any]:
+    transaction_hash = (
+        str(transaction_hash or "")
+        .strip()
+    )
+
+    if not transaction_hash:
         return {
             "valid": False,
             "pending": False,
@@ -1090,7 +1093,7 @@ async def verify_payment(
             ),
         }
 
-    order = await get_order(
+    order = await get_order_for_payment(
         order_id
     )
 
@@ -1098,7 +1101,9 @@ async def verify_payment(
         return {
             "valid": False,
             "pending": False,
-            "reason": "Order not found.",
+            "reason": (
+                "Order was not found."
+            ),
         }
 
     status = str(
@@ -1113,38 +1118,8 @@ async def verify_payment(
             "valid": False,
             "pending": False,
             "reason": (
-                "Order is not accepting "
+                "This order is not accepting "
                 "payment verification."
-            ),
-        }
-
-    stored_hash = str(
-        order["transaction_hash"] or ""
-    ).strip()
-
-    if (
-        stored_hash
-        and stored_hash.lower()
-        != tx_hash.lower()
-    ):
-        return {
-            "valid": False,
-            "pending": False,
-            "reason": (
-                "This order already has a "
-                "different transaction hash."
-            ),
-        }
-
-    if await is_tx_hash_used(
-        tx_hash
-    ):
-        return {
-            "valid": False,
-            "pending": False,
-            "reason": (
-                "This transaction hash has "
-                "already been used."
             ),
         }
 
@@ -1153,46 +1128,37 @@ async def verify_payment(
     )
 
     if chain in {
-        "ethereum",
         "bnb",
+        "ethereum",
     }:
-        result = await verify_evm_payment(
+        return await verify_evm_payment(
             order,
-            tx_hash,
+            transaction_hash,
+            chain,
         )
 
-    elif chain == "solana":
-        result = await verify_solana_payment(
+    if chain == "solana":
+        return await verify_solana_payment(
             order,
-            tx_hash,
+            transaction_hash,
         )
 
-    else:
+    if chain == "robinhood":
         return {
             "valid": False,
             "pending": False,
             "reason": (
-                "Payment verification is not "
-                "available for this chain."
+                "Robinhood Chain payment "
+                "verification is not enabled. "
+                "Please use BNB, Ethereum, "
+                "or Solana payment."
             ),
         }
 
-    if result.get(
-        "valid"
-    ):
-        reserved = await reserve_tx_hash(
-            tx_hash,
-            order_id,
-        )
-
-        if not reserved:
-            return {
-                "valid": False,
-                "pending": False,
-                "reason": (
-                    "Transaction hash was already "
-                    "reserved by another order."
-                ),
-            }
-
-    return result
+    return {
+        "valid": False,
+        "pending": False,
+        "reason": (
+            "Unsupported payment chain."
+        ),
+    }
