@@ -5,19 +5,27 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
 
 from handlers.start import register_user
-from services.token_validator import validate_token
+
+from services.token_validator import (
+    validate_token,
+)
+
 from services.orders import (
     create_order,
     get_payment_wallet,
     submit_transaction_hash,
 )
-from database.connection import get_pool
+
+from database.connection import (
+    get_pool,
+)
 
 
 # ============================================================
@@ -91,8 +99,8 @@ async def trend_start(
 
     await update.message.reply_text(
         "📈 *LIST ON TRENDING*\n\n"
-        "Select the blockchain/network where your token "
-        "is deployed:",
+        "Select the blockchain/network where your "
+        "token is deployed:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -109,6 +117,7 @@ async def chain_selected(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     await query.answer()
 
     data = query.data
@@ -135,9 +144,10 @@ async def chain_selected(
         return ConversationHandler.END
 
     context.user_data["trend_chain"] = chain_key
-    context.user_data["trend_chain_name"] = CHAINS[
-        chain_key
-    ]
+
+    context.user_data["trend_chain_name"] = (
+        CHAINS[chain_key]
+    )
 
     await query.edit_message_text(
         f"✅ *{CHAINS[chain_key]} selected.*\n\n"
@@ -165,12 +175,14 @@ async def contract_received(
         await update.message.reply_text(
             "❌ Please send a contract address."
         )
+
         return ENTER_CONTRACT
 
     if len(contract) > 200:
         await update.message.reply_text(
             "❌ That contract address is too long."
         )
+
         return ENTER_CONTRACT
 
     chain = context.user_data.get(
@@ -186,12 +198,15 @@ async def contract_received(
             "❌ Your trending session has expired.\n\n"
             "Please use /trend again."
         )
+
         return ConversationHandler.END
 
-    checking_message = await update.message.reply_text(
-        "🔎 *Checking token...*\n\n"
-        "⏳ Please wait.",
-        parse_mode="Markdown",
+    checking_message = (
+        await update.message.reply_text(
+            "🔎 *Checking token...*\n\n"
+            "⏳ Please wait.",
+            parse_mode="Markdown",
+        )
     )
 
     try:
@@ -199,7 +214,13 @@ async def contract_received(
             chain,
             contract,
         )
-    except Exception:
+
+    except Exception as exc:
+        print(
+            "Token validation error: "
+            f"{exc}"
+        )
+
         result = {
             "valid": False,
             "reason": (
@@ -219,35 +240,40 @@ async def contract_received(
             f"🌐 Network: {chain_name}\n"
             f"📋 Contract:\n`{contract}`\n\n"
             f"Reason:\n{reason}\n\n"
-            "Please check the network and contract address "
-            "and try again.",
+            "Please check the network and contract "
+            "address and try again.",
             parse_mode="Markdown",
         )
 
         return ENTER_CONTRACT
 
     context.user_data["trend_contract"] = contract
+
     context.user_data["token_info"] = result
 
-    token_name = result.get(
-        "name"
-    ) or "Unknown"
-
-    token_symbol = result.get(
-        "symbol"
-    ) or "Unknown"
-
-    launched = result.get(
-        "launched",
-        False,
+    token_name = (
+        result.get("name")
+        or "Unknown"
     )
 
-    pair = result.get(
-        "pair"
-    ) or {}
+    token_symbol = (
+        result.get("symbol")
+        or "Unknown"
+    )
+
+    launched = bool(
+        result.get(
+            "launched",
+            False,
+        )
+    )
+
+    pair = (
+        result.get("pair")
+        or {}
+    )
 
     if launched:
-
         liquidity = pair.get(
             "liquidity_usd",
             0,
@@ -268,20 +294,64 @@ async def contract_received(
             0,
         ) or 0
 
-        dex = pair.get(
-            "dex",
-            "Unknown",
+        dex = (
+            pair.get("dex")
+            or "Unknown"
         )
+
+        try:
+            liquidity_value = float(
+                liquidity
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            liquidity_value = 0.0
+
+        try:
+            volume_value = float(
+                volume_24h
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            volume_value = 0.0
+
+        try:
+            market_cap_value = float(
+                market_cap
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            market_cap_value = 0.0
+
+        try:
+            price_change_value = float(
+                price_change
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            price_change_value = 0.0
 
         message = (
             "✅ *TOKEN VERIFIED*\n\n"
             f"🌐 Network: {chain_name}\n"
             f"🪙 Name: {token_name}\n"
             f"🔤 Symbol: {token_symbol}\n\n"
-            f"💧 Liquidity: ${float(liquidity):,.2f}\n"
-            f"📊 24h Volume: ${float(volume_24h):,.2f}\n"
-            f"💎 Market Cap: ${float(market_cap):,.2f}\n"
-            f"📈 24h Change: {float(price_change):+.2f}%\n"
+            f"💧 Liquidity: "
+            f"${liquidity_value:,.2f}\n"
+            f"📊 24h Volume: "
+            f"${volume_value:,.2f}\n"
+            f"💎 Market Cap: "
+            f"${market_cap_value:,.2f}\n"
+            f"📈 24h Change: "
+            f"{price_change_value:+.2f}%\n"
             f"🔄 DEX: {dex}\n\n"
             "🟢 *Trading is live.*"
         )
@@ -292,7 +362,6 @@ async def contract_received(
         )
 
     else:
-
         await checking_message.edit_text(
             "✅ *TOKEN FOUND — PRE-LAUNCH*\n\n"
             f"🌐 Network: {chain_name}\n"
@@ -300,7 +369,8 @@ async def contract_received(
             f"🔤 Symbol: {token_symbol}\n\n"
             "🟡 No live DEX trading pair was found yet.\n\n"
             "You can reserve trending before launch. "
-            "The system will monitor the token to go live.",
+            "The system will monitor the token and "
+            "activate the order when trading goes live.",
             parse_mode="Markdown",
         )
 
@@ -325,15 +395,18 @@ async def send_duration_options(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT duration_hours, price_usdt
+            SELECT
+                duration_hours,
+                price_usdt
             FROM pricing
-            ORDER BY duration_hours
+            ORDER BY duration_hours ASC
             """
         )
 
     if not rows:
         await update.message.reply_text(
-            "❌ No trending packages are currently available."
+            "❌ No trending packages are currently "
+            "available."
         )
 
         return
@@ -350,8 +423,13 @@ async def send_duration_options(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    f"⏱ {hours}h — {price:g} USDT",
-                    callback_data=f"trend_duration_{hours}",
+                    (
+                        f"⏱ {hours}h — "
+                        f"{price:g} USDT"
+                    ),
+                    callback_data=(
+                        f"trend_duration_{hours}"
+                    ),
                 )
             ]
         )
@@ -360,7 +438,9 @@ async def send_duration_options(
         [
             InlineKeyboardButton(
                 "❌ Cancel",
-                callback_data="trend_cancel_duration",
+                callback_data=(
+                    "trend_cancel_duration"
+                ),
             )
         ]
     )
@@ -369,7 +449,9 @@ async def send_duration_options(
         "💰 *CHOOSE YOUR TRENDING PACKAGE*\n\n"
         "Select how long you want your token to "
         "remain on The Block Room trending:",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
         parse_mode="Markdown",
     )
 
@@ -383,12 +465,12 @@ async def duration_selected(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     await query.answer()
 
     data = query.data
 
     if data == "trend_cancel_duration":
-
         context.user_data.clear()
 
         await query.edit_message_text(
@@ -413,8 +495,8 @@ async def duration_selected(
                 "",
             )
         )
-    except ValueError:
 
+    except ValueError:
         await query.edit_message_text(
             "❌ Invalid duration."
         )
@@ -426,7 +508,9 @@ async def duration_selected(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT duration_hours, price_usdt
+            SELECT
+                duration_hours,
+                price_usdt
             FROM pricing
             WHERE duration_hours = $1
             """,
@@ -434,7 +518,6 @@ async def duration_selected(
         )
 
     if not row:
-
         await query.edit_message_text(
             "❌ This package is no longer available.\n\n"
             "Please start again with /trend."
@@ -467,22 +550,26 @@ async def duration_selected(
 
         return ConversationHandler.END
 
-    token_name = token_info.get(
-        "name"
-    ) or "Unknown"
-
-    token_symbol = token_info.get(
-        "symbol"
-    ) or "Unknown"
-
-    launched = token_info.get(
-        "launched",
-        False,
+    token_name = (
+        token_info.get("name")
+        or "Unknown"
     )
 
-    # --------------------------------------------------------
-    # Check payment wallet
-    # --------------------------------------------------------
+    token_symbol = (
+        token_info.get("symbol")
+        or "Unknown"
+    )
+
+    launched = bool(
+        token_info.get(
+            "launched",
+            False,
+        )
+    )
+
+    # ========================================================
+    # PAYMENT NETWORK
+    # ========================================================
 
     payment_chain_map = {
         "bnb": "BNB",
@@ -494,12 +581,18 @@ async def duration_selected(
         chain
     )
 
+    # Robinhood is supported as a trending chain,
+    # but there is currently no Robinhood USDT
+    # payment rail configured.
     if not payment_chain:
-
         await query.edit_message_text(
-            "❌ Payment for this network is not "
-            "configured yet.\n\n"
-            "Please contact support."
+            "⚠️ *PAYMENT NETWORK UNAVAILABLE*\n\n"
+            "Robinhood trending support is available, "
+            "but payment processing for this network "
+            "has not been configured yet.\n\n"
+            "Please choose BNB Smart Chain, Ethereum, "
+            "or Solana for payment, or contact support.",
+            parse_mode="Markdown",
         )
 
         return ConversationHandler.END
@@ -509,7 +602,6 @@ async def duration_selected(
     )
 
     if not wallet:
-
         await query.edit_message_text(
             "⚠️ *PAYMENT TEMPORARILY UNAVAILABLE*\n\n"
             f"The {payment_chain} USDT payment wallet "
@@ -520,12 +612,11 @@ async def duration_selected(
 
         return ConversationHandler.END
 
-    # --------------------------------------------------------
-    # Create order
-    # --------------------------------------------------------
+    # ========================================================
+    # CREATE ORDER
+    # ========================================================
 
     try:
-
         order = await create_order(
             telegram_id=update.effective_user.id,
             chain=chain,
@@ -538,9 +629,9 @@ async def duration_selected(
         )
 
     except Exception as exc:
-
         print(
-            f"Order creation error: {exc}"
+            "Order creation error: "
+            f"{exc}"
         )
 
         await query.edit_message_text(
@@ -550,31 +641,79 @@ async def duration_selected(
 
         return ConversationHandler.END
 
-    context.user_data["order_id"] = order["id"]
-    context.user_data["order_number"] = order[
-        "order_number"
-    ]
+    if not order:
+        await query.edit_message_text(
+            "❌ We couldn't create your order.\n\n"
+            "Please try again or contact support."
+        )
 
-    # --------------------------------------------------------
-    # Payment instructions
-    # --------------------------------------------------------
+        return ConversationHandler.END
+
+    # Current order schema uses:
+    # id = internal database ID
+    # order_id = public TR-xxxxxx ID
+
+    internal_order_id = order.get(
+        "id"
+    )
+
+    public_order_id = order.get(
+        "order_id"
+    )
+
+    if not internal_order_id or not public_order_id:
+        print(
+            "Order creation returned incomplete "
+            f"order data: {order}"
+        )
+
+        await query.edit_message_text(
+            "❌ Your order could not be initialized "
+            "correctly.\n\n"
+            "Please contact support."
+        )
+
+        return ConversationHandler.END
+
+    context.user_data["order_id"] = (
+        internal_order_id
+    )
+
+    context.user_data["order_number"] = (
+        public_order_id
+    )
+
+    # ========================================================
+    # PAYMENT INSTRUCTIONS
+    # ========================================================
+
+    wallet_chain = (
+        wallet.get("chain")
+        or payment_chain
+    )
+
+    wallet_address = (
+        wallet.get("address")
+        or ""
+    )
 
     await query.edit_message_text(
         "💳 *PAYMENT REQUIRED*\n\n"
-        f"🧾 Order: `{order['order_number']}`\n"
+        f"🧾 Order: `{public_order_id}`\n"
         f"🪙 Token: {token_name} ({token_symbol})\n"
         f"🌐 Token Network: {CHAINS[chain]}\n"
         f"⏱ Duration: {duration} hours\n\n"
         f"💰 *Send exactly {price:g} USDT*\n\n"
-        f"🔗 Payment Network:\n"
-        f"{wallet['chain']} — {order['payment_network']}\n\n"
-        f"📥 *Payment Address:*\n"
-        f"`{wallet['address']}`\n\n"
-        "⚠️ Send USDT only using the network shown above.\n"
-        "⚠️ Sending another token or using another network "
-        "may result in loss of funds.\n\n"
-        "After sending the payment, press the button below "
-        "and submit your transaction hash.",
+        f"🔗 *Payment Network:*\n"
+        f"{wallet_chain}\n\n"
+        "📥 *Payment Address:*\n"
+        f"`{wallet_address}`\n\n"
+        "⚠️ Send USDT only using the network shown "
+        "above.\n"
+        "⚠️ Sending another token or using another "
+        "network may result in loss of funds.\n\n"
+        "After sending the payment, press the button "
+        "below and submit your transaction hash.",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
@@ -586,7 +725,9 @@ async def duration_selected(
                 [
                     InlineKeyboardButton(
                         "❌ Cancel Order",
-                        callback_data="trend_cancel_payment",
+                        callback_data=(
+                            "trend_cancel_payment"
+                        ),
                     )
                 ],
             ]
@@ -606,6 +747,7 @@ async def payment_started(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     await query.answer()
 
     order_number = context.user_data.get(
@@ -623,8 +765,8 @@ async def payment_started(
     await query.edit_message_text(
         "🔐 *SUBMIT TRANSACTION HASH*\n\n"
         f"🧾 Order: `{order_number}`\n\n"
-        "Please send the transaction hash / TXID of "
-        "your USDT payment.\n\n"
+        "Please send the transaction hash / TXID "
+        "of your USDT payment.\n\n"
         "Send only the transaction hash.",
         parse_mode="Markdown",
     )
@@ -645,7 +787,6 @@ async def transaction_hash_received(
     ).strip()
 
     if not tx_hash:
-
         await update.message.reply_text(
             "❌ Please send your transaction hash."
         )
@@ -653,7 +794,6 @@ async def transaction_hash_received(
         return ENTER_TX_HASH
 
     if len(tx_hash) > 300:
-
         await update.message.reply_text(
             "❌ That transaction hash is too long.\n\n"
             "Please send only the TX hash."
@@ -670,7 +810,6 @@ async def transaction_hash_received(
     )
 
     if not order_id or not order_number:
-
         await update.message.reply_text(
             "❌ Your order session has expired.\n\n"
             "Please use /trend again."
@@ -678,23 +817,42 @@ async def transaction_hash_received(
 
         return ConversationHandler.END
 
-    result = await submit_transaction_hash(
-        order_id,
-        tx_hash,
-    )
+    try:
+        result = await submit_transaction_hash(
+            order_id,
+            tx_hash,
+        )
+
+    except Exception as exc:
+        print(
+            "Transaction submission error: "
+            f"{exc}"
+        )
+
+        await update.message.reply_text(
+            "❌ We couldn't submit this transaction "
+            "hash right now.\n\n"
+            "Please try again."
+        )
+
+        return ENTER_TX_HASH
 
     if not result.get("success"):
-
         reason = result.get(
             "reason"
         )
 
         if reason == "TX_HASH_ALREADY_USED":
+            existing_order = (
+                result.get("order_number")
+                or result.get("order_id")
+                or "another order"
+            )
 
             await update.message.reply_text(
                 "❌ *TRANSACTION ALREADY SUBMITTED*\n\n"
-                f"This TX hash is already connected to order "
-                f"`{result.get('order_number')}`.\n\n"
+                "This transaction hash is already "
+                f"connected to `{existing_order}`.\n\n"
                 "Please check your transaction hash.",
                 parse_mode="Markdown",
             )
@@ -702,33 +860,46 @@ async def transaction_hash_received(
             return ENTER_TX_HASH
 
         if reason == "ORDER_NOT_FOUND":
-
             await update.message.reply_text(
                 "❌ Order not found.\n\n"
                 "Please start again with /trend."
             )
 
+            context.user_data.clear()
+
+            return ConversationHandler.END
+
+        if reason == "ORDER_NOT_ACCEPTING_PAYMENT":
+            await update.message.reply_text(
+                "❌ This order is no longer accepting "
+                "payment submissions.\n\n"
+                "Please start a new order with /trend."
+            )
+
+            context.user_data.clear()
+
             return ConversationHandler.END
 
         await update.message.reply_text(
-            "❌ This order is no longer accepting payment "
-            "submissions."
+            "❌ This transaction hash could not be "
+            "submitted for the current order.\n\n"
+            "Please check the TX hash and try again."
         )
 
-        return ConversationHandler.END
+        return ENTER_TX_HASH
 
-    # --------------------------------------------------------
-    # Payment is NOT verified yet.
-    # --------------------------------------------------------
+    # ========================================================
+    # PAYMENT SUBMITTED
+    # ========================================================
 
     await update.message.reply_text(
         "⏳ *PAYMENT SUBMITTED*\n\n"
         f"🧾 Order: `{order_number}`\n\n"
         "Your transaction hash has been received.\n\n"
-        "🔎 We will now verify the transaction on the "
-        "blockchain.\n\n"
-        "Your order will only become active after the "
-        "payment passes all verification checks.",
+        "🔎 We will now verify the transaction "
+        "on the blockchain.\n\n"
+        "Your order will only become active after "
+        "the payment passes all verification checks.",
         parse_mode="Markdown",
     )
 
@@ -746,6 +917,7 @@ async def cancel_payment(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     await query.answer()
 
     order_id = context.user_data.get(
@@ -753,7 +925,6 @@ async def cancel_payment(
     )
 
     if order_id:
-
         pool = get_pool()
 
         async with pool.acquire() as conn:
