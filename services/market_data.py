@@ -1,12 +1,22 @@
-import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import httpx
 
 
-DEX_BASE_URL = "https://api.dexscreener.com"
+DEX_SCREENER_BASE_URL = (
+    "https://api.dexscreener.com"
+)
 
+TOKEN_PAIRS_ENDPOINT = (
+    DEX_SCREENER_BASE_URL
+    + "/token-pairs/v1/{chain_id}/{token_address}"
+)
+
+
+# ============================================================
+# CHAIN CONFIGURATION
+# ============================================================
 
 CHAIN_IDS = {
     "bnb": "bsc",
@@ -16,11 +26,22 @@ CHAIN_IDS = {
 }
 
 
+# Wrapped native assets used when a pair is quoted
+# against the chain's native asset.
+
 WRAPPED_NATIVE = {
-    "bnb": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
-    "ethereum": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    "solana": "So11111111111111111111111111111111111111112",
-    "robinhood": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "bnb": (
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
+    ),
+    "ethereum": (
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+    ),
+    "solana": (
+        "So11111111111111111111111111111111111111112"
+    ),
+    "robinhood": (
+        "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+    ),
 }
 
 
@@ -32,39 +53,27 @@ NATIVE_SYMBOLS = {
 }
 
 
-STABLECOINS = {
-    "bnb": {
-        "0x55d398326f99059ff775485246999027b3197955",
-        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
-    },
-    "ethereum": {
-        "0xdac17f958d2ee523a2206206994597c13d831ec7",
-        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-        "0x6b175474e89094c44da98b954eedeac495271d0f",
-    },
-    "robinhood": {
-        "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
-    },
-    "solana": {
-        "epjfwdd5auoahk5csp8q7j2x5p6m5h4j4f6x7h8j9k",
-        "es9vmfrzacer m jfrf4h2fyd4kconk11mcce8benwnyb"
-            .replace(" ", ""),
-    },
-}
+# ============================================================
+# CACHE
+# ============================================================
+
+_CACHE: dict[
+    tuple[str, str],
+    tuple[float, Any],
+] = {}
+
+CACHE_SECONDS = 10
 
 
-CACHE_SECONDS = 20
-
-
-_market_cache: Dict[str, Any] = {}
-_cache_lock = asyncio.Lock()
-
+# ============================================================
+# NORMALIZATION
+# ============================================================
 
 def normalize_chain(
     chain: str,
 ) -> str:
     value = (
-        str(chain)
+        str(chain or "")
         .strip()
         .lower()
     )
@@ -86,87 +95,33 @@ def normalize_chain(
 
 
 def normalize_address(
-    address: str,
+    address: Optional[str],
 ) -> str:
-    return str(address).strip()
-
-
-def _cache_key(
-    chain: str,
-    address: str,
-) -> str:
-    return (
-        f"{normalize_chain(chain)}:"
-        f"{normalize_address(address).lower()}"
-    )
-
-
-async def _http_get_json(
-    url: str,
-) -> Optional[Any]:
-    try:
-        async with httpx.AsyncClient(
-            timeout=15
-        ) as client:
-            response = await client.get(
-                url,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": (
-                        "TheBlockRoom/1.0"
-                    ),
-                },
-            )
-
-            response.raise_for_status()
-
-            return response.json()
-
-    except Exception as exc:
-        print(
-            "Market-data HTTP error: "
-            f"{exc}"
-        )
-        return None
-
-
-async def get_token_pairs(
-    chain: str,
-    token_address: str,
-) -> List[Dict[str, Any]]:
-    chain = normalize_chain(chain)
-
-    chain_id = CHAIN_IDS.get(chain)
-
-    if not chain_id:
-        return []
-
-    address = normalize_address(
-        token_address
-    )
-
     if not address:
-        return []
+        return ""
 
-    url = (
-        f"{DEX_BASE_URL}/token-pairs/v1/"
-        f"{chain_id}/{address}"
-    )
-
-    data = await _http_get_json(url)
-
-    if not isinstance(data, list):
-        return []
-
-    return data
+    return address.strip()
 
 
-def _safe_float(
+def normalize_evm_address(
+    address: Optional[str],
+) -> str:
+    return normalize_address(
+        address
+    ).lower()
+
+
+# ============================================================
+# SAFE NUMERIC HELPERS
+# ============================================================
+
+def safe_float(
     value: Any,
+    default: float = 0.0,
 ) -> float:
     try:
         if value is None:
-            return 0.0
+            return default
 
         return float(value)
 
@@ -174,15 +129,16 @@ def _safe_float(
         TypeError,
         ValueError,
     ):
-        return 0.0
+        return default
 
 
-def _safe_int(
+def safe_int(
     value: Any,
+    default: int = 0,
 ) -> int:
     try:
         if value is None:
-            return 0
+            return default
 
         return int(value)
 
@@ -190,125 +146,267 @@ def _safe_int(
         TypeError,
         ValueError,
     ):
-        return 0
+        return default
 
 
-def select_best_pair(
-    pairs: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+# ============================================================
+# DEX SCREENER REQUEST
+# ============================================================
+
+async def get_token_pairs(
+    chain: str,
+    token_address: str,
+):
+    chain = normalize_chain(chain)
+    token_address = normalize_address(
+        token_address
+    )
+
+    chain_id = CHAIN_IDS.get(chain)
+
+    if not chain_id:
+        return []
+
+    if not token_address:
+        return []
+
+    cache_key = (
+        chain,
+        token_address.lower(),
+    )
+
+    now = time.monotonic()
+
+    cached = _CACHE.get(
+        cache_key
+    )
+
+    if cached:
+        cached_at, cached_value = cached
+
+        if (
+            now - cached_at
+            < CACHE_SECONDS
+        ):
+            return cached_value
+
+    url = TOKEN_PAIRS_ENDPOINT.format(
+        chain_id=chain_id,
+        token_address=token_address,
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=15
+        ) as client:
+            response = await client.get(
+                url
+            )
+
+            if response.status_code == 404:
+                pairs = []
+
+            else:
+                response.raise_for_status()
+
+                data = response.json()
+
+                if isinstance(
+                    data,
+                    dict,
+                ):
+                    pairs = data.get(
+                        "pairs",
+                        [],
+                    )
+
+                elif isinstance(
+                    data,
+                    list,
+                ):
+                    pairs = data
+
+                else:
+                    pairs = []
+
+    except Exception as exc:
+        print(
+            "DEX Screener market-data "
+            f"error chain={chain} "
+            f"token={token_address}: "
+            f"{exc}"
+        )
+
+        return []
+
+    if not isinstance(
+        pairs,
+        list,
+    ):
+        pairs = []
+
+    _CACHE[cache_key] = (
+        now,
+        pairs,
+    )
+
+    return pairs
+
+
+# ============================================================
+# BEST PAIR
+# ============================================================
+
+def choose_best_pair(
+    pairs: list,
+) -> Optional[dict]:
     if not pairs:
         return None
 
-    def score(
-        pair: Dict[str, Any],
-    ):
-        liquidity = _safe_float(
-            pair.get("liquidity", {}).get(
-                "usd"
-            )
+    valid_pairs = []
+
+    for pair in pairs:
+        if not isinstance(
+            pair,
+            dict,
+        ):
+            continue
+
+        liquidity = (
+            pair.get("liquidity")
+            or {}
         )
 
-        volume_24h = _safe_float(
-            pair.get("volume", {}).get(
-                "h24"
-            )
+        volume = (
+            pair.get("volume")
+            or {}
         )
 
-        txns = pair.get(
-            "txns",
-            {},
+        txns = (
+            pair.get("txns")
+            or {}
         )
 
-        buys = _safe_int(
-            txns.get("h24", {}).get(
-                "buys"
-            )
+        liquidity_usd = safe_float(
+            liquidity.get("usd")
         )
 
-        sells = _safe_int(
-            txns.get("h24", {}).get(
-                "sells"
-            )
+        volume_24h = safe_float(
+            volume.get("h24")
+        )
+
+        h24_txns = (
+            txns.get("h24")
+            or {}
+        )
+
+        buys = safe_int(
+            h24_txns.get("buys")
+        )
+
+        sells = safe_int(
+            h24_txns.get("sells")
         )
 
         activity = buys + sells
 
-        return (
-            liquidity,
-            volume_24h,
-            activity,
+        valid_pairs.append(
+            (
+                liquidity_usd,
+                volume_24h,
+                activity,
+                pair,
+            )
         )
 
-    return max(
-        pairs,
-        key=score,
+    if not valid_pairs:
+        return None
+
+    valid_pairs.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+            item[2],
+        ),
+        reverse=True,
     )
 
+    return valid_pairs[0][3]
 
-# Compatibility alias used by other services.
-choose_best_pair = select_best_pair
 
+# ============================================================
+# PARSE PAIR
+# ============================================================
 
 def parse_pair(
-    pair: Dict[str, Any],
-) -> Dict[str, Any]:
-    base = pair.get(
-        "baseToken",
-        {}
+    pair: dict,
+    chain: Optional[str] = None,
+) -> dict:
+    chain = normalize_chain(
+        chain
+        or pair.get("chainId")
+        or ""
     )
 
-    quote = pair.get(
-        "quoteToken",
-        {}
+    base = (
+        pair.get("baseToken")
+        or {}
     )
 
-    liquidity = pair.get(
-        "liquidity",
-        {}
+    quote = (
+        pair.get("quoteToken")
+        or {}
     )
 
-    volume = pair.get(
-        "volume",
-        {}
+    liquidity = (
+        pair.get("liquidity")
+        or {}
     )
 
-    price_change = pair.get(
-        "priceChange",
-        {}
+    volume = (
+        pair.get("volume")
+        or {}
     )
 
-    txns = pair.get(
-        "txns",
-        {}
+    price_change = (
+        pair.get("priceChange")
+        or {}
     )
 
-    tx_5m = txns.get(
-        "m5",
-        {}
+    txns = (
+        pair.get("txns")
+        or {}
     )
 
-    tx_1h = txns.get(
-        "h1",
-        {}
-    )
+    def tx_values(
+        period: str,
+    ):
+        values = (
+            txns.get(period)
+            or {}
+        )
 
-    tx_6h = txns.get(
-        "h6",
-        {}
-    )
+        return {
+            "buys": safe_int(
+                values.get("buys")
+            ),
+            "sells": safe_int(
+                values.get("sells")
+            ),
+        }
 
-    tx_24h = txns.get(
-        "h24",
-        {}
-    )
+    tx_5m = tx_values("m5")
+    tx_1h = tx_values("h1")
+    tx_6h = tx_values("h6")
+    tx_24h = tx_values("h24")
 
     return {
         "name": base.get(
             "name"
-        ),
+        ) or "Unknown",
         "symbol": base.get(
             "symbol"
-        ),
+        ) or "UNKNOWN",
         "address": base.get(
             "address"
         ),
@@ -321,9 +419,7 @@ def parse_pair(
             "dexId"
         ),
 
-        "chain": pair.get(
-            "chainId"
-        ),
+        "chain": chain,
 
         "url": pair.get(
             "url"
@@ -333,186 +429,263 @@ def parse_pair(
             "url"
         ),
 
-        "price_usd": _safe_float(
-            pair.get("priceUsd")
+        "price_usd": safe_float(
+            pair.get(
+                "priceUsd"
+            )
         ),
 
-        "price_native": _safe_float(
-            pair.get("priceNative")
+        "price_native": safe_float(
+            pair.get(
+                "priceNative"
+            )
         ),
 
-        "liquidity_usd": _safe_float(
+        "liquidity_usd": safe_float(
             liquidity.get("usd")
         ),
 
-        "liquidity_base": _safe_float(
+        "liquidity_base": safe_float(
             liquidity.get("base")
         ),
 
-        "liquidity_quote": _safe_float(
+        "liquidity_quote": safe_float(
             liquidity.get("quote")
         ),
 
-        "market_cap": _safe_float(
+        "market_cap": safe_float(
             pair.get("marketCap")
         ),
 
-        "fdv": _safe_float(
+        "fdv": safe_float(
             pair.get("fdv")
         ),
 
-        "volume_5m": _safe_float(
+        "volume_5m": safe_float(
             volume.get("m5")
         ),
 
-        "volume_1h": _safe_float(
+        "volume_1h": safe_float(
             volume.get("h1")
         ),
 
-        "volume_6h": _safe_float(
+        "volume_6h": safe_float(
             volume.get("h6")
         ),
 
-        "volume_24h": _safe_float(
+        "volume_24h": safe_float(
             volume.get("h24")
         ),
 
-        "price_change_5m": _safe_float(
+        "price_change_5m": safe_float(
             price_change.get("m5")
         ),
 
-        "price_change_1h": _safe_float(
+        "price_change_1h": safe_float(
             price_change.get("h1")
         ),
 
-        "price_change_6h": _safe_float(
+        "price_change_6h": safe_float(
             price_change.get("h6")
         ),
 
-        "price_change_24h": _safe_float(
+        "price_change_24h": safe_float(
             price_change.get("h24")
         ),
 
-        "buys_5m": _safe_int(
-            tx_5m.get("buys")
-        ),
+        "buys_5m": tx_5m["buys"],
+        "sells_5m": tx_5m["sells"],
 
-        "sells_5m": _safe_int(
-            tx_5m.get("sells")
-        ),
+        "buys_1h": tx_1h["buys"],
+        "sells_1h": tx_1h["sells"],
 
-        "buys_1h": _safe_int(
-            tx_1h.get("buys")
-        ),
+        "buys_6h": tx_6h["buys"],
+        "sells_6h": tx_6h["sells"],
 
-        "sells_1h": _safe_int(
-            tx_1h.get("sells")
-        ),
-
-        "buys_6h": _safe_int(
-            tx_6h.get("buys")
-        ),
-
-        "sells_6h": _safe_int(
-            tx_6h.get("sells")
-        ),
-
-        "buys_24h": _safe_int(
-            tx_24h.get("buys")
-        ),
-
-        "sells_24h": _safe_int(
-            tx_24h.get("sells")
-        ),
+        "buys_24h": tx_24h["buys"],
+        "sells_24h": tx_24h["sells"],
 
         "pair_created_at": pair.get(
             "pairCreatedAt"
         ),
 
-        "quote_token": {
-            "name": quote.get(
-                "name"
-            ),
-            "symbol": quote.get(
-                "symbol"
-            ),
-            "address": quote.get(
-                "address"
-            ),
-        },
-
-        "labels": pair.get(
-            "labels",
-            [],
+        "quote_address": quote.get(
+            "address"
         ),
 
-        "image_url": pair.get(
-            "info",
-            {}
-        ).get(
-            "imageUrl"
+        "quote_name": quote.get(
+            "name"
+        ),
+
+        "quote_symbol": quote.get(
+            "symbol"
+        ),
+
+        "labels": pair.get(
+            "labels"
+        ) or [],
+
+        "image_url": (
+            pair.get("info", {})
+            .get("imageUrl")
         ),
     }
 
 
-async def get_token_market_data(
+# ============================================================
+# BEST TOKEN MARKET DATA
+# ============================================================
+
+async def get_best_token_pair(
     chain: str,
     token_address: str,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict]:
     chain = normalize_chain(chain)
-
-    key = _cache_key(
-        chain,
-        token_address,
-    )
-
-    now = time.monotonic()
-
-    async with _cache_lock:
-        cached = _market_cache.get(
-            key
-        )
-
-        if cached:
-            timestamp, value = cached
-
-            if (
-                now - timestamp
-                < CACHE_SECONDS
-            ):
-                return value
 
     pairs = await get_token_pairs(
         chain,
         token_address,
     )
 
-    best = select_best_pair(
+    best = choose_best_pair(
         pairs
     )
 
     if not best:
         return None
 
-    parsed = parse_pair(
-        best
+    return parse_pair(
+        best,
+        chain,
     )
 
-    async with _cache_lock:
-        _market_cache[key] = (
-            now,
-            parsed,
-        )
 
-    return parsed
+# ============================================================
+# COMPATIBILITY FUNCTION
+# ============================================================
 
+async def get_token_market_data(
+    chain: str,
+    token_address: str,
+) -> Optional[dict]:
+    return await get_best_token_pair(
+        chain,
+        token_address,
+    )
+
+
+# ============================================================
+# SIMPLE PRICE HELPERS
+# ============================================================
+
+async def get_token_price_usd(
+    chain: str,
+    token_address: str,
+) -> float:
+    data = await get_best_token_pair(
+        chain,
+        token_address,
+    )
+
+    if not data:
+        return 0.0
+
+    return safe_float(
+        data.get("price_usd")
+    )
+
+
+async def get_token_market_cap(
+    chain: str,
+    token_address: str,
+) -> float:
+    data = await get_best_token_pair(
+        chain,
+        token_address,
+    )
+
+    if not data:
+        return 0.0
+
+    return safe_float(
+        data.get("market_cap")
+    )
+
+
+async def get_token_volume_24h(
+    chain: str,
+    token_address: str,
+) -> float:
+    data = await get_best_token_pair(
+        chain,
+        token_address,
+    )
+
+    if not data:
+        return 0.0
+
+    return safe_float(
+        data.get("volume_24h")
+    )
+
+
+async def get_token_liquidity_usd(
+    chain: str,
+    token_address: str,
+) -> float:
+    data = await get_best_token_pair(
+        chain,
+        token_address,
+    )
+
+    if not data:
+        return 0.0
+
+    return safe_float(
+        data.get("liquidity_usd")
+    )
+
+
+# ============================================================
+# WRAPPED NATIVE HELPERS
+# ============================================================
+
+def get_wrapped_native_address(
+    chain: str,
+) -> str:
+    chain = normalize_chain(
+        chain
+    )
+
+    return WRAPPED_NATIVE.get(
+        chain,
+        "",
+    )
+
+
+def get_native_symbol(
+    chain: str,
+) -> str:
+    chain = normalize_chain(
+        chain
+    )
+
+    return NATIVE_SYMBOLS.get(
+        chain,
+        "",
+    )
+
+
+# ============================================================
+# SAFE MARKET DATA
+# ============================================================
 
 async def get_market_data_safe(
     chain: str,
     token_address: str,
-) -> Dict[str, Any]:
+) -> dict:
     try:
-        data = await get_token_market_data(
+        data = await get_best_token_pair(
             chain,
             token_address,
         )
@@ -528,58 +701,81 @@ async def get_market_data_safe(
             f"{exc}"
         )
 
-    return {}
+    return {
+        "name": "Unknown",
+        "symbol": "UNKNOWN",
+        "address": token_address,
+        "pair_address": None,
+        "dex": None,
+        "chain": normalize_chain(chain),
+        "url": None,
+        "dex_url": None,
+        "price_usd": 0.0,
+        "price_native": 0.0,
+        "liquidity_usd": 0.0,
+        "liquidity_base": 0.0,
+        "liquidity_quote": 0.0,
+        "market_cap": 0.0,
+        "fdv": 0.0,
+        "volume_5m": 0.0,
+        "volume_1h": 0.0,
+        "volume_6h": 0.0,
+        "volume_24h": 0.0,
+        "price_change_5m": 0.0,
+        "price_change_1h": 0.0,
+        "price_change_6h": 0.0,
+        "price_change_24h": 0.0,
+        "buys_5m": 0,
+        "sells_5m": 0,
+        "buys_1h": 0,
+        "sells_1h": 0,
+        "buys_6h": 0,
+        "sells_6h": 0,
+        "buys_24h": 0,
+        "sells_24h": 0,
+        "pair_created_at": None,
+        "quote_address": None,
+        "quote_name": None,
+        "quote_symbol": None,
+        "labels": [],
+        "image_url": None,
+    }
 
+
+# ============================================================
+# NATIVE ASSET USD PRICE
+# ============================================================
 
 async def get_native_price_usd(
     chain: str,
 ) -> float:
     """
-    Gets the native asset USD price.
-
-    BNB:
-        WBNB
-
-    Ethereum:
-        WETH
-
-    Solana:
-        WSOL
-
-    Robinhood:
-        WETH, because Robinhood Chain uses ETH
-        as its native gas asset.
+    Gets the approximate USD price of the native
+    asset by querying a well-known wrapped-native
+    token pair.
     """
 
-    chain = normalize_chain(chain)
+    chain = normalize_chain(
+        chain
+    )
 
-    wrapped = WRAPPED_NATIVE.get(
+    wrapped = get_wrapped_native_address(
         chain
     )
 
     if not wrapped:
         return 0.0
 
-    pairs = await get_token_pairs(
+    data = await get_best_token_pair(
         chain,
         wrapped,
     )
 
-    best = select_best_pair(
-        pairs
-    )
-
-    if not best:
+    if not data:
         return 0.0
 
-    parsed = parse_pair(
-        best
-    )
-
-    return _safe_float(
-        parsed.get(
-            "price_usd"
-        )
+    return safe_float(
+        data.get("price_usd")
     )
 
 
@@ -607,110 +803,68 @@ async def get_robinhood_eth_price_usd() -> float:
     )
 
 
-async def quote_amount_to_usd(
-    chain: str,
-    quote_address: str,
-    amount: float,
-) -> float:
-    """
-    Converts a quote-token amount into USD.
-
-    Stablecoins are treated as approximately $1.
-
-    Wrapped native assets use the current native
-    market price.
-
-    Other quote tokens are priced through DEX
-    market data when available.
-    """
-
-    chain = normalize_chain(chain)
-
-    quote_address = normalize_address(
-        quote_address
-    )
-
-    if amount <= 0:
-        return 0.0
-
-    if (
-        quote_address.lower()
-        in STABLECOINS.get(
-            chain,
-            set(),
-        )
-    ):
-        return amount
-
-    wrapped = WRAPPED_NATIVE.get(
-        chain
-    )
-
-    if (
-        wrapped
-        and quote_address.lower()
-        == wrapped.lower()
-    ):
-        price = await get_native_price_usd(
-            chain
-        )
-
-        return amount * price
-
-    quote_data = (
-        await get_token_market_data(
-            chain,
-            quote_address,
-        )
-    )
-
-    if not quote_data:
-        return 0.0
-
-    price = _safe_float(
-        quote_data.get(
-            "price_usd"
-        )
-    )
-
-    return amount * price
-
+# ============================================================
+# NATIVE AMOUNT CONVERSION
+# ============================================================
 
 async def native_amount_to_usd(
     chain: str,
     amount: float,
 ) -> float:
-    if amount <= 0:
-        return 0.0
-
     price = await get_native_price_usd(
         chain
     )
 
-    return amount * price
+    return (
+        safe_float(amount)
+        * price
+    )
 
 
-async def clear_market_cache():
-    async with _cache_lock:
-        _market_cache.clear()
+async def quote_amount_to_usd(
+    chain: str,
+    quote_symbol: str,
+    amount: float,
+) -> float:
+    """
+    Converts a quote-token amount to USD.
 
+    For the native wrapped asset, the current
+    native price is used.
 
-async def cleanup_market_cache():
-    now = time.monotonic()
+    For stablecoins, the amount is treated
+    approximately as USD.
+    """
 
-    async with _cache_lock:
-        expired = [
-            key
-            for key, value
-            in _market_cache.items()
-            if (
-                now - value[0]
-                >= CACHE_SECONDS
-            )
-        ]
+    symbol = (
+        str(quote_symbol or "")
+        .strip()
+        .upper()
+    )
 
-        for key in expired:
-            _market_cache.pop(
-                key,
-                None,
-            )
+    amount = safe_float(
+        amount
+    )
+
+    if amount <= 0:
+        return 0.0
+
+    if symbol in (
+        "USDT",
+        "USDC",
+        "DAI",
+        "BUSD",
+    ):
+        return amount
+
+    native_symbol = get_native_symbol(
+        chain
+    ).upper()
+
+    if symbol == native_symbol:
+        return await native_amount_to_usd(
+            chain,
+            amount,
+        )
+
+    return 0.0
